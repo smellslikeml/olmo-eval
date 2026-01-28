@@ -55,6 +55,9 @@ class QueryHelper:
         # Save experiment and task results, get the experiment PK
         experiment_pk = self.experiment_repo.save(result)
 
+        # Get the experiment_group for denormalization - must never be empty
+        experiment_group = result.experiment_group or result.experiment_name or result.experiment_id
+
         # Build task_hash lookup from result.tasks
         task_hash_lookup: dict[str, str] = {}
         for task in result.tasks:
@@ -71,6 +74,7 @@ class QueryHelper:
                 experiment_pk=experiment_pk,
                 task_hash=task_hash,
                 instances=instances,
+                experiment_group=experiment_group,
             )
 
         return experiment_pk
@@ -295,6 +299,44 @@ class QueryHelper:
         """
         return self.instance_repo.get_instances_by_task(
             task_name=task_name,
+            task_hash=task_hash,
+            limit=limit,
+            after_id=after_id,
+        )
+
+    def query_instances(
+        self,
+        experiment_ids: list[str] | None = None,
+        model_names: list[str] | None = None,
+        model_hashes: list[str] | None = None,
+        task_names: list[str] | None = None,
+        task_hash: str | None = None,
+        limit: int | None = None,
+        after_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query instances with composable filters.
+
+        All filters are optional and compose with AND logic. This is the
+        preferred method for querying instances - filters can be combined
+        freely.
+
+        Args:
+            experiment_ids: Filter by experiment ID strings.
+            model_names: Filter by model names.
+            model_hashes: Filter by model hashes.
+            task_names: Filter by task names.
+            task_hash: Filter by exact task hash.
+            limit: Maximum number of results.
+            after_id: Return instances with id > after_id (keyset pagination).
+
+        Returns:
+            List of instance dicts with task_name and model_hash included.
+        """
+        return self.instance_repo.query_instances(
+            experiment_ids=experiment_ids,
+            model_names=model_names,
+            model_hashes=model_hashes,
+            task_names=task_names,
             task_hash=task_hash,
             limit=limit,
             after_id=after_id,

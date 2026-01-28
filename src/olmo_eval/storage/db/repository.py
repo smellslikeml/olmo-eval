@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, select
 from sqlalchemy.orm import Session
 
 from olmo_eval.core.types import EvalResult, StoredTaskResult
@@ -37,6 +37,11 @@ class ExperimentRepository:
         Returns:
             The auto-increment id (PK) of the saved experiment.
         """
+        # Use experiment_group from eval_result, or fall back to experiment_name/experiment_id
+        # experiment_group must never be empty
+        experiment_group = (
+            eval_result.experiment_group or eval_result.experiment_name or eval_result.experiment_id
+        )
         experiment = Experiment(
             experiment_id=eval_result.experiment_id,
             model_name=eval_result.model_name,
@@ -53,6 +58,7 @@ class ExperimentRepository:
             s3_location=eval_result.s3_location,
             model_path=eval_result.model_path,
             metadata_=eval_result.metadata,
+            experiment_group=experiment_group,
         )
         self.session.add(experiment)
         self.session.flush()  # Get the auto-generated id
@@ -243,6 +249,7 @@ class ExperimentRepository:
             model_config=experiment.model_config,
             metadata=experiment.metadata_,
             model_path=experiment.model_path,
+            experiment_group=experiment.experiment_group,
         )
 
 
@@ -262,6 +269,7 @@ class InstancePredictionRepository:
         experiment_pk: int,
         task_hash: str,
         instances: list[dict[str, Any]],
+        experiment_group: str = "",
     ) -> None:
         """Save instance predictions for an experiment's task.
 
@@ -271,6 +279,7 @@ class InstancePredictionRepository:
             instances: List of instance dicts with keys:
                 - native_id: Original dataset ID
                 - instance_metrics: Dict of metric names to values
+            experiment_group: Experiment group for fast filtering (denormalized).
         """
         for inst_data in instances:
             instance = InstancePrediction(
@@ -278,6 +287,7 @@ class InstancePredictionRepository:
                 task_hash=task_hash,
                 native_id=inst_data["native_id"],
                 instance_metrics=inst_data["instance_metrics"],
+                experiment_group=experiment_group,
             )
             self.session.add(instance)
 
@@ -545,6 +555,104 @@ class InstancePredictionRepository:
             "instance_metrics": instance.instance_metrics,
         }
 
+    def query_instances(
+        self,
+        experiment_ids: list[str] | None = None,
+        model_names: list[str] | None = None,
+        model_hashes: list[str] | None = None,
+        task_names: list[str] | None = None,
+        task_hash: str | None = None,
+        limit: int | None = None,
+        after_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query instances with composable filters.
+
+        All filters are optional and compose with AND logic. Joins are added
+        automatically based on which filters are provided.
+
+        Args:
+            experiment_ids: Filter by experiment ID strings.
+            model_names: Filter by model names.
+            model_hashes: Filter by model hashes.
+            task_names: Filter by task names.
+            task_hash: Filter by exact task hash.
+            limit: Maximum number of results.
+            after_id: Return instances with id > after_id (keyset pagination).
+
+        Returns:
+            List of instance dicts with task_name and model_hash included.
+        """
+        # Determine required joins based on filters
+        needs_experiment_join = bool(experiment_ids or model_names or model_hashes)
+
+        # Build select - always include task_name and model_hash for consistency
+        columns = [
+            InstancePrediction.id,
+            InstancePrediction.task_hash,
+            InstancePrediction.native_id,
+            InstancePrediction.instance_metrics,
+            TaskResult.task_name,
+        ]
+        if needs_experiment_join:
+            columns.append(Experiment.model_hash)
+
+        stmt = select(*columns)
+
+        # Always join TaskResult to get task_name
+        stmt = stmt.join(
+            TaskResult,
+            and_(
+                TaskResult.experiment_pk == InstancePrediction.experiment_pk,
+                TaskResult.task_hash == InstancePrediction.task_hash,
+            ),
+        )
+
+        # Join Experiment if needed for model/experiment_id filters
+        if needs_experiment_join:
+            stmt = stmt.join(Experiment, Experiment.id == InstancePrediction.experiment_pk)
+
+        # Apply filters - all compose with AND
+        if after_id is not None:
+            stmt = stmt.where(InstancePrediction.id > after_id)
+
+        if experiment_ids:
+            stmt = stmt.where(Experiment.experiment_id.in_(experiment_ids))
+
+        if model_names:
+            stmt = stmt.where(Experiment.model_name.in_(model_names))
+
+        if model_hashes:
+            stmt = stmt.where(Experiment.model_hash.in_(model_hashes))
+
+        if task_hash:
+            stmt = stmt.where(InstancePrediction.task_hash == task_hash)
+
+        if task_names:
+            stmt = stmt.where(TaskResult.task_name.in_(task_names))
+
+        stmt = stmt.order_by(InstancePrediction.id)
+
+        if limit:
+            stmt = stmt.limit(limit)
+
+        results = self.session.execute(stmt).all()
+
+        # Build result dicts with consistent schema
+        output = []
+        for row in results:
+            d: dict[str, Any] = {
+                "id": row.id,
+                "task_hash": row.task_hash,
+                "task_name": row.task_name,
+                "native_id": row.native_id,
+                "instance_metrics": row.instance_metrics,
+            }
+            if needs_experiment_join:
+                d["model_hash"] = row.model_hash
+            output.append(d)
+
+        return output
+
     def stream_instances(
         self,
         experiment_pk: int,
@@ -573,3 +681,68 @@ class InstancePredictionRepository:
 
         for instance in self.session.execute(stmt).scalars().yield_per(batch_size):
             yield self._to_instance_dict(instance)
+
+    def stream_instances_with_metadata(
+        self,
+        experiment_group: str | None = None,
+        experiment_pk: int | None = None,
+        model_hashes: list[str] | None = None,
+        task_hashes: list[str] | None = None,
+        batch_size: int = 10000,
+    ) -> Iterator[Any]:
+        """Stream instances with metadata. Used by all instance queries.
+
+        Returns rows sorted by (model_hash, task_hash, id) for single-pass grouping.
+        Uses server-side cursor for constant memory usage.
+
+        Args:
+            experiment_group: Filter by experiment group.
+            experiment_pk: Filter by experiment primary key.
+            model_hashes: Filter by model hash(es).
+            task_hashes: Filter by task hash(es).
+            batch_size: Number of rows to fetch per batch.
+
+        Yields:
+            SQLAlchemy Row objects with instance and metadata fields.
+        """
+        from sqlalchemy import and_
+
+        # Build query with JOINs to get metadata
+        stmt = (
+            select(
+                InstancePrediction.id,
+                InstancePrediction.task_hash,
+                InstancePrediction.native_id,
+                InstancePrediction.instance_metrics,
+                InstancePrediction.experiment_group,
+                Experiment.model_name,
+                Experiment.model_hash,
+                TaskResult.task_name,
+                TaskResult.metrics.label("task_metrics"),
+            )
+            .join(Experiment, Experiment.id == InstancePrediction.experiment_pk)
+            .join(
+                TaskResult,
+                and_(
+                    TaskResult.experiment_pk == InstancePrediction.experiment_pk,
+                    TaskResult.task_hash == InstancePrediction.task_hash,
+                ),
+            )
+        )
+
+        # Apply filters
+        if experiment_group:
+            stmt = stmt.where(InstancePrediction.experiment_group == experiment_group)
+        if experiment_pk:
+            stmt = stmt.where(InstancePrediction.experiment_pk == experiment_pk)
+        if model_hashes:
+            stmt = stmt.where(Experiment.model_hash.in_(model_hashes))
+        if task_hashes:
+            stmt = stmt.where(InstancePrediction.task_hash.in_(task_hashes))
+
+        # Sort for single-pass grouping, stream with server-side cursor
+        stmt = stmt.order_by(
+            Experiment.model_hash, InstancePrediction.task_hash, InstancePrediction.id
+        ).execution_options(yield_per=batch_size)
+
+        yield from self.session.execute(stmt)
