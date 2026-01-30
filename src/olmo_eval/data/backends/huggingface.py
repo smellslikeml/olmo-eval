@@ -46,7 +46,6 @@ class HuggingFaceBackend:
             name=source.subset,
             split=source.split,
             streaming=streaming,
-            trust_remote_code=True,
         )
 
         yield from dataset
