@@ -31,24 +31,22 @@ class C4Task(Task):
         if self._instances_cache is None:
             self._instances_cache = []
             loader = DataLoader()
-            source = self._get_source_for_split(self.default_split, self.default_subset)
+            source = self._get_source_for_split(self.default_split)
             for doc in loader.load(source):
                 self._instances_cache.append(self.process_doc(doc))
         yield from self._instances_cache
 
-    def _get_source_for_split(self, split: str, subset: str) -> DataSource:
+    def _get_source_for_split(self, split: str) -> DataSource:
         """Get data source for a specific split."""
         return DataSource(
             path=self.default_source,
             split=split,
-            subset=subset,
+            subset=self.default_subset,
         )
 
     def process_doc(self, doc: dict[str, Any], index: int = 0) -> Instance:
         """Convert a dataset document to an Instance."""
-        text = (doc.get("text") or "").strip()
-        if not text:
-            return None
+        text = doc["text"]
 
         return Instance(
             question="",  # Context
@@ -64,11 +62,12 @@ class C4Task(Task):
         """Format an instance into an LM request."""
         if self.config.formatter is not None:
             return self.config.formatter.format(instance, self.get_fewshot())
-
+        gold = instance.gold_answer
+        continuations = (gold,) if gold is not None else None
         return LMRequest(
             request_type=RequestType.LOGLIKELIHOOD,
             prompt=instance.question,
-            continuations=(instance.gold_answer,),
+            continuations=continuations,
         )
 
     def extract_answer(self, output: LMOutput) -> str:
