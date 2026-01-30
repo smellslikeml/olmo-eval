@@ -29,6 +29,7 @@ from .metrics import (
     MeanPerplexityMetric,
     Metric,
     PassAtKMetric,
+    CorpusPerplexityMetric,
 )
 from .scorers import (
     BitsPerByteScorer,
