@@ -25,11 +25,11 @@ from .logging import (
 from .metrics import (
     AccuracyMetric,
     BPBMetric,
+    CorpusPerplexityMetric,
     F1Metric,
     MeanPerplexityMetric,
     Metric,
     PassAtKMetric,
-    CorpusPerplexityMetric,
 )
 from .scorers import (
     BitsPerByteScorer,
@@ -105,6 +105,7 @@ __all__ = [
     "F1Metric",
     "BPBMetric",
     "MeanPerplexityMetric",
+    "CorpusPerplexityMetric",
     # Code execution
     "CodeExecutionScorer",
     "PassAtKMetric",

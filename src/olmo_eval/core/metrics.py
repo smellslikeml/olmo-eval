@@ -240,6 +240,6 @@ class CorpusPerplexityMetric(Metric):
 
         if total_tokens == 0:
             return 0.0
-        
+
         avg_logprob = total_logprob / total_tokens
         return math.exp(-avg_logprob)

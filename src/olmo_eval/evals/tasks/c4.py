@@ -1,6 +1,6 @@
 """C4 perplexity task implementations."""
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from typing import Any
 
 from olmo_eval.core import (
@@ -75,7 +75,7 @@ class C4Task(Task):
     def extract_answer(self, output: LMOutput) -> str:
         # Not used for scoring
         return output.text
-    
+
 
 class C41KTask(C4Task):
     """C4 perplexity task on 1,000 randomly sampled documents."""
