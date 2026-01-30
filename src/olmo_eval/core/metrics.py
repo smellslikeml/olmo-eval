@@ -238,15 +238,6 @@ class CorpusPerplexityMetric(Metric):
             total_logprob += scorer.score(response.instance, output)
             total_tokens += len(output.logprobs)
 
-            # if output.logprobs is None:
-            #     continue
-            # for tok in output.logprobs:
-            #     lp = tok.get("logprob")
-            #     if lp is None:
-            #         continue
-            #     total_logprob += lp
-            #     total_tokens += 1
-
         if total_tokens == 0:
             return 0.0
         
