@@ -2,9 +2,12 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
+
+if TYPE_CHECKING:
+    from olmo_eval.launch.beaker.launcher import BeakerJobConfig
 
 console = Console()
 
@@ -41,19 +44,26 @@ class ModelSummary:
 
 @dataclass
 class TaskSummary:
-    """Summary of a task configuration for display."""
+    """Summary of a task configuration for display.
 
-    name: str
+    Holds the task config directly to avoid duplicating fields.
+    """
+
+    config: Any  # TaskConfig or AgentTaskConfig
     spec: str | None = None
     variants: list[str] | None = None
-    formatter: Any = None
-    scorers: tuple = ()
-    metrics: tuple = ()
-    num_fewshot: int = 0
-    split: str = "test"
-    primary_metric: str | None = None
-    sampling_params: Any = None
     overrides: dict[str, Any] | None = None
+
+    @property
+    def name(self) -> str:
+        return self.config.name
+
+    @property
+    def tool_names(self) -> list[str] | None:
+        """Return tool names if this is an agent task with tools."""
+        if hasattr(self.config, "tools") and self.config.tools:
+            return [t.name for t in self.config.tools]
+        return None
 
 
 @dataclass
@@ -80,12 +90,14 @@ class RunnerConfig:
 
 
 @dataclass
-class EvalSummary:
-    """Complete launch configuration summary for pretty-printing."""
+class ExperimentSummary:
+    """Per-experiment summary for beaker launch display."""
 
+    name: str
     models: list[ModelSummary]
     tasks: list[TaskSummary]
     runner: RunnerConfig
+    beaker: "BeakerJobConfig"
 
 
 def parse_model_spec(spec: str) -> tuple[str, dict[str, Any]]:

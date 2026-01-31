@@ -6,9 +6,12 @@ from pathlib import Path
 
 # Re-export from core for backward compatibility
 from .core import (
+    AgentTask,
+    AgentTaskConfig,
     Task,
     TaskConfig,
     clear_registry,
+    get_base_task_name,
     get_task,
     list_regimes,
     list_tasks,
@@ -22,9 +25,12 @@ from .core import (
 )
 
 __all__ = [
+    "AgentTask",
+    "AgentTaskConfig",
     "Task",
     "TaskConfig",
     "clear_registry",
+    "get_base_task_name",
     "get_task",
     "list_regimes",
     "list_tasks",

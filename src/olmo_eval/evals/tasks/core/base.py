@@ -7,16 +7,16 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from olmo_eval.core import (
-    Formatter,
+from olmo_eval.core.formatters import Formatter
+from olmo_eval.core.metrics import Metric
+from olmo_eval.core.scorers import Scorer
+from olmo_eval.core.types import (
     Instance,
     LMOutput,
     LMRequest,
-    Metric,
     MetricName,
     Response,
     SamplingParams,
-    Scorer,
     Split,
 )
 
@@ -54,7 +54,6 @@ class TaskConfig:
 
     # Task configuration
     formatter: Formatter | None = None
-    scorers: tuple[Scorer, ...] = ()
     metrics: tuple[Metric, ...] = ()
     num_fewshot: int = 0
     fewshot_seed: int = 42
@@ -139,15 +138,36 @@ class TaskConfig:
             "data_source": serialize_data_source(self.data_source),
             "fewshot_source": serialize_data_source(self.fewshot_source),
             "formatter": self.formatter.to_dict() if self.formatter else None,
-            "scorers": [s.to_dict() for s in self.scorers],
             "metrics": [m.to_dict() for m in self.metrics],
             "num_fewshot": self.num_fewshot,
             "fewshot_seed": self.fewshot_seed,
             "limit": self.limit,
             "split": self.split.value,
-            "primary_metric": serialize_primary_metric(self.primary_metric),
+            "primary_metric": serialize_primary_metric(self.get_primary_metric()),
             "sampling_params": asdict(self.sampling_params) if self.sampling_params else None,
         }
+
+    def get_primary_metric(self) -> Metric | None:
+        """Get the effective primary metric for this task.
+
+        Returns the explicitly set primary_metric if available, otherwise
+        returns the single metric if exactly one is defined. Returns None
+        if no metrics are defined or multiple metrics exist without an
+        explicit primary.
+
+        Returns:
+            The primary Metric instance, or None.
+        """
+        if self.primary_metric is not None:
+            # If it's a Metric instance, return it directly
+            if isinstance(self.primary_metric, Metric):
+                return self.primary_metric
+            # If it's a MetricName enum, we can't resolve it to an instance here
+            return None
+        # Default to single metric if only one is defined
+        if len(self.metrics) == 1:
+            return self.metrics[0]
+        return None
 
 
 class Task(ABC):
@@ -342,12 +362,23 @@ class Task(ABC):
             raise
 
     def score_responses(self, responses: Sequence[Response]) -> Sequence[Response]:
-        """Apply all scorers to extract answers and compute scores."""
+        """Apply all scorers to extract answers and compute scores.
+
+        Scorers are collected from metrics that define a scorer attribute.
+        """
+        # Collect scorers from metrics, avoiding duplicates by name
+        scorers_by_name: dict[str, Scorer] = {}
+        for metric in self.config.metrics:
+            if hasattr(metric, "scorer") and metric.scorer is not None:
+                scorer_instance = metric.scorer()
+                if scorer_instance.name not in scorers_by_name:
+                    scorers_by_name[scorer_instance.name] = scorer_instance
+
         for response in responses:
             for output in response.outputs:
                 output.extracted_answer = self.extract_answer(output)
             # Apply each scorer, taking best score across outputs (for multi-sample)
-            for scorer in self.config.scorers:
+            for scorer in scorers_by_name.values():
                 scores = [scorer.score(response.instance, o) for o in response.outputs]
                 response.scores[scorer.name] = max(scores) if scores else 0.0
         return responses
