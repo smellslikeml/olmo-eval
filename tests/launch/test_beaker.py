@@ -245,8 +245,8 @@ class TestParseTaskWithPriority:
 
     def test_task_with_regime_and_priority(self):
         """Test task with regime and priority."""
-        task, priority = parse_task_with_priority("mmlu::olmes@high")
-        assert task == "mmlu::olmes"
+        task, priority = parse_task_with_priority("mmlu:olmes@high")
+        assert task == "mmlu:olmes"
         assert priority == "high"
 
     def test_custom_default_priority(self):
@@ -333,9 +333,9 @@ class TestValidatePriorityConfiguration:
         assert result == {"normal": ["mmlu", "gsm8k"]}
 
     def test_task_with_regime_and_priority(self):
-        """Test task with regime (::) and @priority suffix."""
-        result = validate_priority_configuration(["mmlu::olmes@high"], None)
-        assert result == {"high": ["mmlu::olmes"]}
+        """Test task with regime (:) and @priority suffix."""
+        result = validate_priority_configuration(["mmlu:olmes@high"], None)
+        assert result == {"high": ["mmlu:olmes"]}
 
 
 class TestCalculateExperimentSplits:
@@ -492,6 +492,115 @@ class TestCalculateExperimentSplits:
         assert len(result) == 2
         assert result[0]["num_gpus"] == 16
         assert result[0]["parallelism"] == 1
+
+
+class TestBeakerJobConfigTaskPackages:
+    """Tests for BeakerJobConfig task_packages field."""
+
+    def test_task_packages_default_none(self):
+        """Test that task_packages defaults to None."""
+        config = BeakerJobConfig(
+            name="test",
+            command=["echo"],
+            cluster="h100",
+            workspace="ai2/oe-data",
+            budget="ai2/oe-base",
+        )
+        assert config.task_packages is None
+
+    def test_task_packages_can_be_set(self):
+        """Test that task_packages can be set."""
+        config = BeakerJobConfig(
+            name="test",
+            command=["echo"],
+            cluster="h100",
+            workspace="ai2/oe-data",
+            budget="ai2/oe-base",
+            task_packages=["special-lib==1.0", "git+https://github.com/user/repo"],
+        )
+        assert config.task_packages == ["special-lib==1.0", "git+https://github.com/user/repo"]
+
+
+class TestBuildCommandWithTaskPackages:
+    """Tests for command building with task packages."""
+
+    def test_command_includes_task_packages(self):
+        """Test that task packages are installed in the generated command."""
+        from olmo_eval.launch import BeakerLauncher
+
+        launcher = BeakerLauncher()
+        command = launcher._build_command_with_extras(
+            command=["olmo-eval", "run"],
+            extras=[],
+            env_exports=None,
+            provider_package=None,
+            task_packages=["special-lib==1.0", "another-pkg"],
+        )
+
+        # The command should be a bash -c with the full script
+        assert command[0] == "bash"
+        assert command[1] == "-c"
+        script = command[2]
+
+        # Check that task packages are being installed
+        assert "uv pip install 'special-lib==1.0'" in script
+        assert "uv pip install 'another-pkg'" in script
+
+    def test_task_packages_installed_after_provider(self):
+        """Test that task packages are installed after provider package."""
+        from olmo_eval.launch import BeakerLauncher
+
+        launcher = BeakerLauncher()
+        command = launcher._build_command_with_extras(
+            command=["olmo-eval", "run"],
+            extras=[],
+            env_exports=None,
+            provider_package="vllm==0.14.0",
+            task_packages=["task-dep==1.0"],
+        )
+
+        script = command[2]
+
+        # Provider should be installed before task packages
+        provider_pos = script.find("uv pip install 'vllm==0.14.0'")
+        task_pos = script.find("uv pip install 'task-dep==1.0'")
+        assert provider_pos < task_pos
+
+    def test_no_task_packages_if_none(self):
+        """Test that no extra install steps if task_packages is None."""
+        from olmo_eval.launch import BeakerLauncher
+
+        launcher = BeakerLauncher()
+        command = launcher._build_command_with_extras(
+            command=["olmo-eval", "run"],
+            extras=[],
+            env_exports=None,
+            provider_package=None,
+            task_packages=None,
+        )
+
+        script = command[2]
+        # Should only have the base install, not any extra pip install for task packages
+        # Count occurrences of 'uv pip install' - should only be the base install
+        install_count = script.count("uv pip install")
+        assert install_count == 1  # Only the base olmo-eval install
+
+    def test_task_packages_git_url_normalized(self):
+        """Test that git URLs in task packages are normalized."""
+        from olmo_eval.launch import BeakerLauncher
+
+        launcher = BeakerLauncher()
+        command = launcher._build_command_with_extras(
+            command=["olmo-eval", "run"],
+            extras=[],
+            env_exports=None,
+            provider_package=None,
+            task_packages=["https://github.com/user/repo@v1.0"],
+        )
+
+        script = command[2]
+        # GitHub URL should get git+ prefix
+        assert "uv pip install 'git+https://github.com/user/repo@v1.0'" in script
 
 
 class TestNormalizeProviderPackage:
@@ -774,6 +883,60 @@ class TestModelPackingAndGrouping:
         assert experiments[0].num_gpus == 6
 
 
+@pytest.fixture
+def mock_tasks():
+    """Register mock tasks for testing JobConfigAssembler."""
+    from collections.abc import Iterator
+
+    from olmo_eval.core.types import Instance, LMOutput, LMRequest, RequestType
+    from olmo_eval.evals.tasks import Task, TaskConfig, clear_registry, register
+    from olmo_eval.evals.tasks.core.registry import _configs, _regimes, _tasks, _variants
+
+    # Save original state
+    original_tasks = _tasks.copy()
+    original_configs = _configs.copy()
+    original_regimes = {k: v.copy() for k, v in _regimes.items()}
+    original_variants = {k: v.copy() for k, v in _variants.items()}
+
+    class MockTask(Task):
+        @property
+        def instances(self) -> Iterator[Instance]:
+            yield Instance(question="test", gold_answer="test")
+
+        def format_request(self, instance: Instance) -> LMRequest:
+            return LMRequest(request_type=RequestType.COMPLETION, prompt="test")
+
+        def extract_answer(self, output: LMOutput) -> str:
+            return output.text.strip()
+
+    # Register mock tasks used in tests
+    @register("mmlu", lambda: TaskConfig(name="mmlu", data_source="test/dataset"))
+    class MMLUTask(MockTask):
+        pass
+
+    @register("gsm8k", lambda: TaskConfig(name="gsm8k", data_source="test/dataset"))
+    class GSM8KTask(MockTask):
+        pass
+
+    @register(
+        "task_with_deps",
+        lambda: TaskConfig(
+            name="task_with_deps", data_source="test/dataset", dependencies=["base-pkg"]
+        ),
+    )
+    class TaskWithDeps(MockTask):
+        pass
+
+    yield
+
+    # Restore original state
+    clear_registry()
+    _tasks.update(original_tasks)
+    _configs.update(original_configs)
+    _regimes.update(original_regimes)
+    _variants.update(original_variants)
+
+
 class TestTaskOverrideHandling:
     """Tests for task override extraction and command generation."""
 
@@ -850,7 +1013,7 @@ class TestTaskOverrideHandling:
         # Both overrides should be in task_overrides
         assert experiments[0].task_overrides == {"mmlu": ["limit=100", "num_fewshot=5"]}
 
-    def test_task_overrides_in_command(self):
+    def test_task_overrides_in_command(self, mock_tasks):
         """Task overrides are included in the generated command."""
         from olmo_eval.cli.beaker.config_loader import LaunchConfig
         from olmo_eval.cli.beaker.experiment_plan import ExperimentPlan
@@ -910,7 +1073,7 @@ class TestTaskOverrideHandling:
         assert cmd[gsm8k_idx + 3] == "-o"
         assert cmd[gsm8k_idx + 4] == "num_fewshot=3"
 
-    def test_priority_override_not_in_command(self):
+    def test_priority_override_not_in_command(self, mock_tasks):
         """Priority override should not appear in the run command."""
         from olmo_eval.cli.beaker.config_loader import LaunchConfig
         from olmo_eval.cli.beaker.experiment_plan import ExperimentPlan
@@ -962,3 +1125,103 @@ class TestTaskOverrideHandling:
         assert "priority=urgent" not in cmd
         # But experiment priority should be urgent (used for Beaker job)
         assert job_config.priority == "urgent"
+
+    def test_task_packages_from_cli_overrides(self, mock_tasks):
+        """Test that task_packages are extracted from CLI dependency overrides."""
+        from olmo_eval.cli.beaker.config_loader import LaunchConfig
+        from olmo_eval.cli.beaker.experiment_plan import ExperimentPlan
+        from olmo_eval.cli.beaker.job_assembler import JobConfigAssembler
+        from olmo_eval.launch import BeakerModelSpec
+
+        model = BeakerModelSpec(name_or_path="model1")
+        exp = ExperimentPlan(
+            name="test-exp",
+            model_cfgs=[model],
+            model_specs=["model1"],
+            priority="normal",
+            tasks=["mmlu"],
+            original_task_specs=["mmlu"],
+            total_expanded_tasks=1,
+            model_gpu_counts=[1],
+            num_gpus=1,
+            task_overrides={"mmlu": ['dependencies=["ai2-olmo-eval", "special-pkg==1.0"]']},
+        )
+
+        config = LaunchConfig(
+            name="test",
+            model_configs=[model],
+            model_specs=["model1"],
+            task_specs=["mmlu"],
+            cluster="h100",
+            workspace="test",
+            budget="test",
+        )
+
+        assembler = JobConfigAssembler(
+            config=config,
+            eval_config=None,
+            effective_image="test-image",
+            effective_groups=[],
+            beaker_username="test-user",
+            common_secrets=[],
+            store_secrets=[],
+            task_secrets=[],
+            inject_aws_credentials=False,
+            inject_gcs_credentials=False,
+        )
+
+        job_config = assembler.assemble(exp)
+
+        # Dependencies from CLI overrides should be in task_packages
+        assert job_config.task_packages == ["ai2-olmo-eval", "special-pkg==1.0"]
+
+    def test_task_packages_merged_from_config_and_cli(self, mock_tasks):
+        """Test that task_packages from config and CLI are merged."""
+        from olmo_eval.cli.beaker.config_loader import LaunchConfig
+        from olmo_eval.cli.beaker.experiment_plan import ExperimentPlan
+        from olmo_eval.cli.beaker.job_assembler import JobConfigAssembler
+        from olmo_eval.launch import BeakerModelSpec
+
+        model = BeakerModelSpec(name_or_path="model1")
+        # task_with_deps has dependencies=["base-pkg"] registered
+        exp = ExperimentPlan(
+            name="test-exp",
+            model_cfgs=[model],
+            model_specs=["model1"],
+            priority="normal",
+            tasks=["task_with_deps"],
+            original_task_specs=["task_with_deps"],
+            total_expanded_tasks=1,
+            model_gpu_counts=[1],
+            num_gpus=1,
+            task_overrides={"task_with_deps": ['dependencies=["cli-pkg==2.0"]']},
+        )
+
+        config = LaunchConfig(
+            name="test",
+            model_configs=[model],
+            model_specs=["model1"],
+            task_specs=["task_with_deps"],
+            cluster="h100",
+            workspace="test",
+            budget="test",
+        )
+
+        assembler = JobConfigAssembler(
+            config=config,
+            eval_config=None,
+            effective_image="test-image",
+            effective_groups=[],
+            beaker_username="test-user",
+            common_secrets=[],
+            store_secrets=[],
+            task_secrets=[],
+            inject_aws_credentials=False,
+            inject_gcs_credentials=False,
+        )
+
+        job_config = assembler.assemble(exp)
+
+        # Both registered deps (base-pkg) and CLI deps (cli-pkg==2.0) should be present
+        assert "base-pkg" in job_config.task_packages
+        assert "cli-pkg==2.0" in job_config.task_packages

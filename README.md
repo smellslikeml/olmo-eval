@@ -81,6 +81,17 @@ register_regime("my_task", "olmes", num_fewshot=5, fewshot_seed=42)
 # Usage: olmo-eval run -m model -t my_task:olmes
 ```
 
+**Runtime Dependencies** allow tasks to specify packages installed at job startup:
+
+```python
+@register("code_eval", lambda: TaskConfig(
+    name="code_eval",
+    data_source="my-org/code-dataset",
+    dependencies=["code-sandbox==1.0", "git+https://github.com/user/repo@v2.0"],
+))
+class CodeEvalTask(Task): ...
+```
+
 ### Suites
 
 Suites group multiple tasks for batch evaluation:
@@ -90,7 +101,7 @@ from olmo_eval.evals.suites import Suite, register
 
 register(Suite(
     name="my_suite",
-    tasks=("task_a::olmes", "task_b::olmes", "task_c::olmes"),
+    tasks=("task_a:olmes", "task_b:olmes", "task_c:olmes"),
 ))
 ```
 
@@ -307,6 +318,7 @@ class MyTaskImpl(MyTask):
 | `fewshot_seed` | `int` | `42` | Random seed for few-shot |
 | `limit` | `int \| None` | `None` | Max instances to evaluate |
 | `split` | `Split` | `Split.TEST` | Dataset split to use |
+| `dependencies` | `list[str] \| None` | `None` | Runtime packages to install (e.g., `["pkg==1.0"]`) |
 
 ### Data Sources
 
@@ -683,10 +695,9 @@ Available inference providers:
 | `--workspace` | `-w` | required | Beaker workspace |
 | `--budget` | `-B` | required | Beaker budget |
 | `--group` | `-g` | none | Add experiments to Beaker group(s) (can specify multiple) |
-| `--async` | `-a` | `false` | Enable parallel task execution |
-| `--async-stream` | | `false` | Use vLLM's AsyncLLMEngine for continuous batching |
-| `--num-workers` | `-W` | auto | Number of workers for async mode |
-| `--gpus-per-worker` | | `1` | GPUs per worker for async mode |
+| `--runner-type` | `-R` | `sync` | Runner type: `sync`, `async`, `async-stream`, `agent` |
+| `--num-workers` | `-W` | auto | Number of workers for async/async-stream modes |
+| `--gpus-per-worker` | | `1` | GPUs per worker for async/async-stream modes |
 | `--dry-run` | `-d` | `false` | Print spec without launching |
 | `--follow/--no-follow` | | `true` | Follow logs after launch |
 
@@ -964,6 +975,23 @@ olmo-eval beaker launch -n "eval" -m llama3.1-8b -o provider.name=vllm -t mmlu
 uv pip install -e '.[vllm]'  # includes vllm[runai]
 ```
 
+### Task-Specific Dependencies
+
+Tasks can declare runtime dependencies that are installed at job startup (see [Tasks](#tasks)). Dependencies are automatically merged, deduplicated, and installed after the inference provider.
+
+You can also add or override dependencies via the CLI:
+
+```bash
+# Add dependencies to a task via -o flag
+olmo-eval beaker launch -n "eval" -m llama3.1-8b \
+    -t code_eval -o 'dependencies=["code-sandbox==1.0", "git+https://github.com/user/repo@v2.0"]'
+
+# Dependencies from multiple tasks are merged
+olmo-eval beaker launch -n "eval" -m llama3.1-8b \
+    -t task_a -o 'dependencies=["pkg1"]' \
+    -t task_b -o 'dependencies=["pkg2"]'
+```
+
 ### Pushing to Beaker
 
 ```bash
@@ -1047,39 +1075,46 @@ Configure via environment variables:
 
 ## Advanced Usage
 
-### Parallel Execution
+### Runner Types
 
-By default, tasks run sequentially. Two parallel execution modes are available for faster evaluation:
+By default, tasks run sequentially. Different runner types are available for various use cases:
 
-| Mode | Flag | Backend | Best For |
-|------|------|---------|----------|
-| Sequential | (default) | Any | Simple runs, debugging |
-| Async | `--async` | Any | Multi-GPU batch processing |
-| Streaming | `--async-stream` | vLLM only | Generative tasks only |
+| Runner | Flag | Backend | Best For |
+|--------|------|---------|----------|
+| Sync | (default) | Any | Simple runs, debugging |
+| Async | `--runner-type async` | Any | Multi-GPU batch processing |
+| Async-Stream | `--runner-type async-stream` | vLLM only | Generative tasks only |
+| Agent | `--runner-type agent` | vLLM | Multi-turn agent tasks |
 
-**Sequential Mode (Default)** - Runs one task at a time:
+**Sync Mode (Default)** - Runs one task at a time:
 
 ```bash
 olmo-eval run -m llama3.1-8b -t mmlu -t gsm8k -t arc
 ```
 
-**Async Mode (`--async`)** - Spawns worker processes that each load the model and process batches in parallel:
+**Async Mode** - Spawns worker processes that each load the model and process batches in parallel:
 
 ```bash
 # Auto-detect workers from available GPUs
-olmo-eval run --async -m llama3.1-8b -t mmlu -t gsm8k -t arc
+olmo-eval run --runner-type async -m llama3.1-8b -t mmlu -t gsm8k -t arc
 
 # Specify number of workers
-olmo-eval run --async --num-workers 4 -m llama3.1-8b -t mmlu -t gsm8k
+olmo-eval run --runner-type async --num-workers 4 -m llama3.1-8b -t mmlu -t gsm8k
 
 # Multi-GPU models (e.g., 70B on 4 GPUs per worker)
-olmo-eval run --async --num-workers 2 --gpus-per-worker 4 -m llama3.1-70b -t mmlu
+olmo-eval run --runner-type async --num-workers 2 --gpus-per-worker 4 -m llama3.1-70b -t mmlu
 ```
 
-**Streaming Mode (`--async-stream`)** - Uses vLLM's AsyncLLMEngine for true continuous batching:
+**Async-Stream Mode** - Uses vLLM's AsyncLLMEngine for true continuous batching:
 
 ```bash
-olmo-eval run --async-stream -m llama3.1-8b -t mmlu -t gsm8k -t arc
+olmo-eval run --runner-type async-stream -m llama3.1-8b -t mmlu -t gsm8k -t arc
+```
+
+**Agent Mode** - For multi-turn agent tasks with tool use:
+
+```bash
+olmo-eval run --runner-type agent -m llama3.1-8b -t simpleqa_agent
 ```
 
 ## Debugging and Inspection
