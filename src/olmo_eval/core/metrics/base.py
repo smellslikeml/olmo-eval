@@ -1,5 +1,6 @@
 """Metric base class and implementations."""
 
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -9,6 +10,7 @@ from ..scorers import (
     BitsPerByteScorer,
     ExactMatchScorer,
     F1Scorer,
+    LogprobScorer,
     PerplexityScorer,
     Scorer,
     ToolCallScorer,
@@ -255,3 +257,40 @@ class ToolAccuracyMetric(Metric):
         scorer_name = self.scorer().name
         total = sum(r.scores.get(scorer_name, 0.0) for r in responses)
         return total / len(responses)
+
+
+@dataclass(frozen=True, slots=True)
+class CorpusPerplexityMetric(Metric):
+    """Corpus-level (token-weighted) perplexity.
+
+    This is the standard token-weighted aggregation across documents.
+    Documents that exceed the model's context length are truncated.
+    """
+
+    name: str = "corpus_perplexity"
+    scorer: type[Scorer] = LogprobScorer
+
+    def compute(self, responses: Sequence[Response]) -> float:
+        if not responses:
+            return 0.0
+
+        scorer = self.scorer()
+        total_logprob = 0.0
+        total_tokens = 0
+
+        for response in responses:
+            outputs = response.outputs
+            if not outputs:
+                continue
+            # This should contain the output for the entire doc
+            output = outputs[0]
+            if output.logprobs is None:
+                continue
+            total_logprob += scorer.score(response.instance, output)
+            total_tokens += len(output.logprobs)
+
+        if total_tokens == 0:
+            return 0.0
+
+        avg_logprob = total_logprob / total_tokens
+        return math.exp(-avg_logprob)

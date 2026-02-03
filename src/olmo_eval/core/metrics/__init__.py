@@ -3,6 +3,7 @@
 from .base import (
     AccuracyMetric,
     BPBMetric,
+    CorpusPerplexityMetric,
     F1Metric,
     MeanPerplexityMetric,
     Metric,
@@ -20,4 +21,5 @@ __all__ = [
     "PassAtKMetric",
     "PassPowKMetric",
     "ToolAccuracyMetric",
+    "CorpusPerplexityMetric",
 ]
