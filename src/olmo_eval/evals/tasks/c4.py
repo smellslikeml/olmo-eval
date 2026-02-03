@@ -3,12 +3,11 @@
 from collections.abc import Iterator
 from typing import Any
 
-from olmo_eval.core import (
-    CorpusPerplexityMetric,
+from olmo_eval.core.metrics import CorpusPerplexityMetric
+from olmo_eval.core.types import (
     Instance,
     LMOutput,
     LMRequest,
-    PerplexityScorer,
     RequestType,
 )
 from olmo_eval.data import DataLoader, DataSource
@@ -102,7 +101,6 @@ def _c4_config() -> TaskConfig:
     return TaskConfig(
         name="c4",
         data_source=DataSource(path="valentinhofmann/c4_short", subset="full", split="validation"),
-        scorers=(),
         metrics=(),
     )
 
@@ -111,7 +109,6 @@ def _c4_1k_config() -> TaskConfig:
     return TaskConfig(
         name="c4_1k",
         data_source=DataSource(path="valentinhofmann/c4_short", subset="1k", split="validation"),
-        scorers=(),
         metrics=(),
     )
 
@@ -120,7 +117,6 @@ def _c4_10k_config() -> TaskConfig:
     return TaskConfig(
         name="c4_10k",
         data_source=DataSource(path="valentinhofmann/c4_short", subset="10k", split="validation"),
-        scorers=(),
         metrics=(),
     )
 
@@ -129,7 +125,6 @@ def _c4_100k_config() -> TaskConfig:
     return TaskConfig(
         name="c4_100k",
         data_source=DataSource(path="valentinhofmann/c4_short", subset="100k", split="validation"),
-        scorers=(),
         metrics=(),
     )
 
