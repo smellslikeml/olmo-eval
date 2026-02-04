@@ -27,6 +27,9 @@ class ModelGrouper:
         self.config = config
         self.eval_config = eval_config
 
+    # Providers that don't require GPUs (remote API or mock)
+    _NO_GPU_PROVIDERS = {"litellm", "mock"}
+
     def get_model_resources(self, m_cfg: BeakerModelSpec, m_spec: str) -> dict[str, Any]:
         """Get runtime-critical resources for a model.
 
@@ -48,6 +51,21 @@ class ModelGrouper:
             m_parallelism = m_cfg.parallelism
             m_cluster = m_cfg.cluster or self.config.cluster
             m_provider = m_cfg.provider
+
+        # Remote API providers don't need GPUs
+        # m_provider may be a string (from EvalConfig.get_model_resources) or ProviderConfig
+        if m_provider:
+            if hasattr(m_provider, "kind"):
+                kind = m_provider.kind
+                provider_name = kind.value if hasattr(kind, "value") else kind
+            else:
+                provider_name = m_provider  # Already a string
+        else:
+            provider_name = None
+        if provider_name in self._NO_GPU_PROVIDERS:
+            m_gpus = 0
+            m_parallelism = 1
+
         return {
             "gpus": m_gpus,
             "parallelism": m_parallelism,
@@ -72,8 +90,16 @@ class ModelGrouper:
         resources = self.get_model_resources(m_cfg, m_spec)
 
         # Convert provider to string for comparison (ProviderConfig is not sortable)
+        # provider may be a ProviderConfig or already a string
         provider = resources["provider"]
-        provider_str = provider.name if provider and hasattr(provider, "name") else str(provider)
+        if provider:
+            if hasattr(provider, "kind"):
+                kind = provider.kind
+                provider_str = kind.value if hasattr(kind, "value") else kind
+            else:
+                provider_str = provider  # Already a string
+        else:
+            provider_str = "default"
 
         # gpus and parallelism are NOT part of signature - models with different
         # GPU counts can run together if they fit on the same node

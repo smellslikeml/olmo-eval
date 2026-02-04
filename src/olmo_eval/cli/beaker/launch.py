@@ -63,7 +63,7 @@ from olmo_eval.core.types import RunnerType
     multiple=True,
     cls=OrderedMultiOption,
     save_to="_ordered",
-    help="Override for preceding -m or -t (e.g., -o provider.name=vllm -o limit=100)",
+    help="Override for preceding -m or -t (e.g., -o provider.kind=vllm -o limit=100)",
 )
 @click.option("--cluster", "-c", default=None, help="Cluster alias (h100, a100, aus) or full name")
 @click.option(
@@ -251,7 +251,7 @@ def launch(
     Use -o/--override after -m or -t to apply overrides to that model or task:
 
         olmo-eval beaker launch -n eval \\
-            -m llama3.1-8b -o provider.name=vllm -o provider.package=vllm==0.14.0 \\
+            -m llama3.1-8b -o provider.kind=vllm -o provider.package=vllm==0.14.0 \\
             -t mmlu -o limit=100
     """
     from datetime import datetime
@@ -400,11 +400,16 @@ def launch(
     # (task_overrides is already filtered - priority extracted above)
     task_configs_by_spec = _get_task_configs(valid_tasks, launch_config.task_overrides)
 
-    # Collect required secrets
+    # Collect required secrets from tasks
     all_required_secrets: set[str] = set()
     for task_cfg in task_configs_by_spec.values():
         if hasattr(task_cfg, "required_secrets") and task_cfg.required_secrets:
             all_required_secrets.update(task_cfg.required_secrets)
+
+    # Collect provider-required secrets from model configs
+    for model_cfg in launch_config.model_configs:
+        if model_cfg.provider and model_cfg.provider.required_secrets:
+            all_required_secrets.update(model_cfg.provider.required_secrets)
 
     # Ensure secrets
     common_secrets, store_secrets, task_secrets = _ensure_secrets(
@@ -643,11 +648,16 @@ def _print_experiment_matrix(
         )
 
         # Provider display
+        def _get_provider_str(p):
+            if not p:
+                return "default"
+            kind = p.kind
+            return kind.value if hasattr(kind, "value") else kind
+
         if len(exp.model_cfgs) == 1:
-            provider = exp.model_cfgs[0].provider
-            provider_display = provider.name if provider else "default"
+            provider_display = _get_provider_str(exp.model_cfgs[0].provider)
         else:
-            providers = {m.provider.name if m.provider else "default" for m in exp.model_cfgs}
+            providers = {_get_provider_str(m.provider) for m in exp.model_cfgs}
             provider_display = ", ".join(sorted(providers))
 
         # Task display - show actual task names

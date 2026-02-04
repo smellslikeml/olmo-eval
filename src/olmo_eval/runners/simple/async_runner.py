@@ -5,21 +5,18 @@ from __future__ import annotations
 import multiprocessing as mp
 import random
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 from rich.console import Console
 
 from olmo_eval.core.constants.infrastructure import BEAKER_RESULT_DIR
-from olmo_eval.core.literals import ProviderLiteral
 from olmo_eval.core.logging import get_logger, get_worker_id
 from olmo_eval.inference import ProviderType
 from olmo_eval.runners.mixins import S3Config
 from olmo_eval.runners.simple.async_base import AsyncBaseRunner
-from olmo_eval.runners.simple.helpers import wait_for_workers_ready
+from olmo_eval.runners.simple.helpers import terminate_workers, wait_for_workers_ready
 from olmo_eval.runners.simple.workers import instance_worker_process
-
-if TYPE_CHECKING:
-    from olmo_eval.storage import StorageBackend
+from olmo_eval.storage import StorageBackend
 
 console = Console()
 logger = get_logger(__name__)
@@ -80,11 +77,6 @@ class AsyncEvalRunner(AsyncBaseRunner):
         # Prepare tasks
         expanded_tasks, trackers, model_items, model_configs = self._prepare_tasks()
 
-        # Apply provider override if specified
-        for model_name in self.model_names:
-            if self.provider_override:
-                model_configs[model_name].provider = cast(ProviderLiteral, self.provider_override)
-
         total_pairs = len(self.model_names) * len(expanded_tasks)
         total_instances = sum(len(items) for items in model_items.values())
 
@@ -114,79 +106,92 @@ class AsyncEvalRunner(AsyncBaseRunner):
         workers: list[mp.process.BaseProcess] = []
         gpu_offset = 0
 
-        for model_name in self.model_names:
-            model_config = model_configs[model_name]
-            provider_type = ProviderType(model_config.provider)
+        try:
+            for model_name in self.model_names:
+                model_config = model_configs[model_name]
+                provider_type = ProviderType(model_config.get_provider_name(self.provider_override))
 
-            # Get per-model vLLM loading options
-            per_model_overrides = self.model_overrides.get(model_name, {})
-            effective_load_format = per_model_overrides.get("load_format")
-            effective_extra_loader_config = per_model_overrides.get("extra_loader_config")
+                # Get per-model vLLM loading options
+                per_model_overrides = self.model_overrides.get(model_name, {})
+                effective_load_format = per_model_overrides.get("load_format")
+                effective_extra_loader_config = per_model_overrides.get("extra_loader_config")
 
-            for i in range(workers_per_model):
-                worker_id = get_worker_id(model_config.model, i)
-
-                if total_gpus > 0:
-                    start_gpu = gpu_offset + (i * self.gpus_per_worker)
-                    end_gpu = min(start_gpu + self.gpus_per_worker, gpu_offset + gpus_per_model)
-                    gpu_ids = list(range(start_gpu, end_gpu)) if start_gpu < end_gpu else []
-                else:
-                    gpu_ids = []
-
-                worker = ctx.Process(
-                    target=instance_worker_process,
-                    args=(
-                        worker_id,
-                        gpu_ids,
-                        model_queues[model_name],
-                        result_queue,
-                        model_config.model,
-                        provider_type.value,
-                        self.attention_backend,
-                        model_config.tokenizer,
-                        model_config.max_model_len,
-                        effective_load_format,
-                        effective_extra_loader_config,
-                        init_times,
-                    ),
+                # Get max_concurrency from provider config
+                provider_config = per_model_overrides.get("provider", {})
+                effective_max_concurrency = (
+                    provider_config.get("max_concurrency")
+                    if isinstance(provider_config, dict)
+                    else None
                 )
-                worker.start()
-                workers.append(worker)
 
-            gpu_offset += gpus_per_model
+                for i in range(workers_per_model):
+                    worker_id = get_worker_id(model_config.model, i)
 
-        console.print(
-            f"[bold green]{len(workers)} worker(s) started across "
-            f"{len(self.model_names)} model(s), processing instances...[/bold green]"
-        )
+                    if total_gpus > 0:
+                        start_gpu = gpu_offset + (i * self.gpus_per_worker)
+                        end_gpu = min(start_gpu + self.gpus_per_worker, gpu_offset + gpus_per_model)
+                        gpu_ids = list(range(start_gpu, end_gpu)) if start_gpu < end_gpu else []
+                    else:
+                        gpu_ids = []
 
-        # Wait for workers to initialize
-        console.print("[dim]Waiting for workers to initialize...[/dim]")
-        wait_for_workers_ready(workers, result_queue, startup_timeout=60.0)
-        console.print("[dim]Workers initialized successfully[/dim]")
+                    worker = ctx.Process(
+                        target=instance_worker_process,
+                        args=(
+                            worker_id,
+                            gpu_ids,
+                            model_queues[model_name],
+                            result_queue,
+                            model_config.model,
+                            provider_type.value,
+                            self.attention_backend,
+                            model_config.tokenizer,
+                            model_config.max_model_len,
+                            effective_load_format,
+                            effective_extra_loader_config,
+                            effective_max_concurrency,
+                            init_times,
+                        ),
+                    )
+                    worker.start()
+                    workers.append(worker)
 
-        # Capture init times from workers (convert manager dict to regular dict)
-        provider_init_seconds = dict(init_times)
+                gpu_offset += gpus_per_model
 
-        # Process results
-        results = await self._process_results(
-            trackers, result_queue, model_queues, workers, total_pairs, total_instances
-        )
+            console.print(
+                f"[bold green]{len(workers)} worker(s) started across "
+                f"{len(self.model_names)} model(s), processing instances...[/bold green]"
+            )
 
-        # Wait for all workers
-        for worker in workers:
-            worker.join(timeout=10)
-            if worker.is_alive():
-                worker.terminate()
-                worker.join()
+            # Wait for workers to initialize
+            console.print("[dim]Waiting for workers to initialize...[/dim]")
+            wait_for_workers_ready(workers, result_queue, startup_timeout=60.0)
+            console.print("[dim]Workers initialized successfully[/dim]")
 
-        # Compute experiment duration
-        experiment_duration_seconds = time.time() - experiment_start
+            # Capture init times from workers (convert manager dict to regular dict)
+            provider_init_seconds = dict(init_times)
 
-        # Aggregate and save results
-        results_dict = self._aggregate_results(results, expanded_tasks, model_configs, "vllm")
-        return self._finalize_and_save(
-            results_dict,
-            experiment_duration_seconds=experiment_duration_seconds,
-            provider_init_seconds=provider_init_seconds,
-        )
+            # Process results
+            results = await self._process_results(
+                trackers, result_queue, model_queues, workers, total_pairs, total_instances
+            )
+
+            # Wait for all workers
+            for worker in workers:
+                worker.join(timeout=10)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join()
+
+            # Compute experiment duration
+            experiment_duration_seconds = time.time() - experiment_start
+
+            # Aggregate and save results
+            results_dict = self._aggregate_results(results, expanded_tasks, model_configs, "vllm")
+            return self._finalize_and_save(
+                results_dict,
+                experiment_duration_seconds=experiment_duration_seconds,
+                provider_init_seconds=provider_init_seconds,
+            )
+        finally:
+            # Ensure all workers are terminated on any exit (success or failure)
+            terminate_workers(workers)

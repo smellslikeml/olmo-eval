@@ -15,6 +15,7 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_DATASETS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BAR", "1")
+os.environ.setdefault("LITELLM_LOG", "ERROR")
 
 
 def configure_logging(level: LogLevel = "INFO") -> None:
@@ -31,6 +32,10 @@ def configure_logging(level: LogLevel = "INFO") -> None:
     # Suppress noisy third-party loggers
     logging.getLogger("datasets").setLevel(logging.ERROR)
     logging.getLogger("transformers").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+    logging.getLogger("litellm").setLevel(logging.WARNING)
 
     # Set environment variables for third-party libraries
     os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BAR", "1")

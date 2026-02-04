@@ -45,7 +45,7 @@ from typing import Any
 from omegaconf import MISSING, OmegaConf
 
 from olmo_eval.core.constants.infrastructure import DEFAULT_MAX_GPUS_PER_NODE
-from olmo_eval.core.types import RunnerType
+from olmo_eval.core.types import ProviderKind, RunnerType
 
 
 @dataclass
@@ -53,13 +53,17 @@ class ProviderConfig:
     """Configuration for the inference provider to install at runtime.
 
     Attributes:
-        name: Provider name ("vllm", "hf", "litellm"). Maps to pyproject.toml extras.
+        kind: Provider kind (use ProviderKind enum values). Maps to pyproject.toml extras.
         package: Optional custom package specifier (URL, path, or PyPI version).
                  If set, installed after base extras to override default version.
+        max_concurrency: Maximum concurrent API requests (for litellm and other API providers).
+        required_secrets: Environment variables required by this provider (e.g., API keys).
     """
 
-    name: str = "vllm"
+    kind: str = ProviderKind.VLLM
     package: str | None = None
+    max_concurrency: int | None = None
+    required_secrets: tuple[str, ...] = ()
 
 
 @dataclass
@@ -144,14 +148,14 @@ def apply_overrides_to_model(name_or_path: str, overrides: list[str]) -> BeakerM
 
     Args:
         name_or_path: Model name or path.
-        overrides: List of override strings in dotlist format (e.g., ["provider.name=vllm"]).
+        overrides: List of override strings in dotlist format (e.g., ["provider.kind=vllm"]).
 
     Returns:
         BeakerModelSpec instance with overrides applied.
 
     Examples:
-        >>> apply_overrides_to_model("llama3.1-8b", ["provider.name=vllm", "gpus=4"])
-        BeakerModelSpec(name_or_path='llama3.1-8b', provider=ProviderConfig(name='vllm'), gpus=4)
+        >>> apply_overrides_to_model("llama3.1-8b", ["provider.kind=vllm", "gpus=4"])
+        BeakerModelSpec(name_or_path='llama3.1-8b', provider=ProviderConfig(kind='vllm'), gpus=4)
     """
     config_dict: dict[str, Any] = {"name_or_path": name_or_path}
 
@@ -166,6 +170,33 @@ def apply_overrides_to_model(name_or_path: str, overrides: list[str]) -> BeakerM
     return OmegaConf.to_object(merged)  # type: ignore[return-value]
 
 
+def _get_provider_for_model(model_name: str) -> ProviderConfig:
+    """Get provider config for a model, checking presets first then defaulting to vllm.
+
+    Args:
+        model_name: Model name or path.
+
+    Returns:
+        ProviderConfig from preset if available, otherwise default vllm config.
+    """
+    from olmo_eval.core.constants.models import get_model_presets
+
+    presets = get_model_presets()
+    if model_name in presets:
+        preset_provider = presets[model_name].provider
+        # Normalize enum to string value for OmegaConf compatibility
+        kind = preset_provider.kind
+        kind_str: str = str(kind.value) if hasattr(kind, "value") else str(kind)
+        return ProviderConfig(
+            kind=kind_str,
+            package=preset_provider.package,
+            max_concurrency=preset_provider.max_concurrency,
+            required_secrets=preset_provider.required_secrets,
+        )
+    # Not a preset - default to vllm
+    return ProviderConfig(kind=ProviderKind.VLLM.value)
+
+
 def parse_model_config(
     model: str | dict[str, Any] | BeakerModelSpec,
     overrides: list[str] | None = None,
@@ -178,14 +209,14 @@ def parse_model_config(
     Args:
         model: Model name/path string, dict with model config, or BeakerModelSpec.
         overrides: Optional list of override strings in dotlist format
-            (e.g., ["provider.name=vllm"]).
+            (e.g., ["provider.kind=vllm"]).
 
     Returns:
         BeakerModelSpec instance with any overrides applied.
 
     Examples:
         parse_model_config("llama3.1-8b")
-        parse_model_config("llama3.1-8b", overrides=["provider.name=vllm", "gpus=4"])
+        parse_model_config("llama3.1-8b", overrides=["provider.kind=vllm", "gpus=4"])
         parse_model_config({"name_or_path": "llama3.1-70b", "gpus": 4})
     """
     if isinstance(model, BeakerModelSpec):
@@ -199,8 +230,17 @@ def parse_model_config(
             return OmegaConf.to_object(merged)  # type: ignore[return-value]
         return model
 
+    # Providers that don't require GPUs (remote API or mock)
+    no_gpu_providers = {"litellm", "mock"}
+
     if isinstance(model, str):
         config_dict: dict[str, Any] = {"name_or_path": model}
+        # Get provider from preset or default to vllm
+        provider = _get_provider_for_model(model)
+        config_dict["provider"] = provider
+        # Set gpus=0 for API-based providers
+        if provider.kind in no_gpu_providers:
+            config_dict["gpus"] = 0
         if overrides:
             override_config = OmegaConf.from_dotlist(overrides)
             override_dict = OmegaConf.to_container(override_config)
@@ -211,6 +251,13 @@ def parse_model_config(
 
     if isinstance(model, dict):
         config_dict = dict(model)
+        # Get provider from preset or default to vllm if not already specified
+        if "provider" not in config_dict and "name_or_path" in config_dict:
+            provider = _get_provider_for_model(config_dict["name_or_path"])
+            config_dict["provider"] = provider
+            # Set gpus=0 for API-based providers (if not explicitly set)
+            if "gpus" not in config_dict and provider.kind in no_gpu_providers:
+                config_dict["gpus"] = 0
         if overrides:
             override_config = OmegaConf.from_dotlist(overrides)
             override_dict = OmegaConf.to_container(override_config)
@@ -452,9 +499,14 @@ class EvalConfig:
         # Parallelism is always per-model (default 1)
         parallelism = model.parallelism
 
-        # Extract provider name and package from ProviderConfig
-        provider_name = model.provider.name if model.provider else None
+        # Extract provider type, package, and max_concurrency from ProviderConfig
+        if model.provider:
+            kind = model.provider.kind
+            provider_name = kind.value if hasattr(kind, "value") else kind
+        else:
+            provider_name = None
         provider_package = model.provider.package if model.provider else None
+        provider_max_concurrency = model.provider.max_concurrency if model.provider else None
 
         return {
             "gpus": gpus_per_model,
@@ -468,6 +520,7 @@ class EvalConfig:
             "gpus_per_worker": gpus_per_worker,
             "provider": provider_name,
             "provider_package": provider_package,
+            "provider_max_concurrency": provider_max_concurrency,
             "load_format": model.load_format,
             "extra_loader_config": model.extra_loader_config,
         }

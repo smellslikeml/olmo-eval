@@ -430,6 +430,9 @@ class BeakerJobConfig:
     # Task-specific packages to install at runtime
     task_packages: list[str] | None = None
 
+    # Follow mode - when True, wait for experiment to complete
+    follow: bool = False
+
 
 def resolve_clusters(cluster: str | list[str]) -> list[str]:
     """Resolve cluster aliases to full cluster names.
@@ -557,30 +560,30 @@ class BeakerLauncher:
             self._beaker = Beaker.from_env(default_workspace=self._workspace)
         return self._beaker
 
-    def _build_command_with_extras(
+    def _build_install_cmd(
         self,
-        command: list[str],
         extras: list[str],
         env_exports: dict[str, str] | None = None,
         provider_package: str | None = None,
         task_packages: list[str] | None = None,
-    ) -> list[str]:
-        """Build command with source installation and extras installation prepended.
+    ) -> str:
+        """Build installation command for gantry's install_cmd parameter.
 
         Gantry clones the source code to /gantry-runtime, so we:
         1. Install olmo-eval from the cloned source with optional extras
         2. Optionally install a custom provider package to override the default
         3. Optionally install task-specific dependencies
-        4. Run the actual command
 
         Args:
-            command: The command to run after setup.
             extras: Optional dependency group names from pyproject.toml.
             env_exports: Optional dict of environment variables to export before running.
             provider_package: Optional custom provider package to install (overrides default).
             task_packages: Optional list of task-specific packages to install.
+
+        Returns:
+            Shell command string for installation.
         """
-        # Build the full command
+        # Build the install steps
         # Export UV_PROJECT_ENVIRONMENT so all uv commands use Docker's /opt/venv
         steps = ["export UV_PROJECT_ENVIRONMENT=/opt/venv"]
 
@@ -611,13 +614,7 @@ class BeakerLauncher:
                 install_spec = normalize_provider_package(pkg)
                 steps.append(f"uv pip install '{install_spec}' -c {constraints}")
 
-        # Run the actual command (use shlex.join to properly quote special characters)
-        import shlex
-
-        steps.append(shlex.join(command))
-
-        wrapped_command = ["bash", "-c", " && ".join(steps)]
-        return wrapped_command
+        return " && ".join(steps)
 
     def launch(self, config: BeakerJobConfig, dry_run: bool = False) -> BeakerExperiment | None:
         """Launch an experiment on Beaker using gantry.
@@ -633,13 +630,13 @@ class BeakerLauncher:
 
         clusters = resolve_clusters(config.cluster)
 
-        # Build env vars that need to be exported in the shell command (before uv runs)
+        # Build env vars that need to be exported in the install command (before uv runs)
         env_exports: dict[str, str] = {}
         if "UV_CACHE_DIR" in config.env_vars:
             env_exports["UV_CACHE_DIR"] = config.env_vars["UV_CACHE_DIR"]
 
-        final_command = self._build_command_with_extras(
-            config.command,
+        # Build separate install command for gantry's install_cmd parameter
+        install_cmd = self._build_install_cmd(
             config.extras,
             env_exports,
             config.provider_package,
@@ -684,42 +681,13 @@ class BeakerLauncher:
         # Build group names list if groups are specified
         group_names: list[str] | None = config.groups if config.groups else None
 
-        # If doing a dry run, print config summary and return
+        # Print config summary for dry run
         if dry_run:
             self._print_dry_run_config(config, clusters)
-            # Still call launch_experiment with dry_run=True to show full spec
-            # Pass groups so they appear in the spec output (the CLI handles
-            # checking which groups exist and informing the user)
-            launch_experiment(
-                args=final_command,
-                name=config.name,
-                description=config.description,
-                workspace=config.workspace,
-                group_names=group_names,
-                clusters=clusters,
-                gpus=config.num_gpus,
-                shared_memory=config.shared_memory,
-                priority=config.priority,
-                preemptible=config.preemptible,
-                task_timeout=config.timeout,
-                retries=config.retries,
-                budget=config.budget,
-                beaker_image=config.beaker_image,
-                weka=weka_mounts if weka_mounts else None,
-                env_vars=env_vars if env_vars else None,
-                env_secrets=env_secrets if env_secrets else None,
-                google_credentials_secret=google_credentials_secret,
-                mounts=mounts,
-                results=config.result_path,
-                no_python=True,  # Use pre-built image, skip Python setup
-                dry_run=True,
-                yes=True,  # Skip confirmation prompts
-            )
-            return None
 
-        # Launch the experiment
+        # Launch the experiment (or show spec if dry_run)
         workload = launch_experiment(
-            args=final_command,
+            args=config.command,
             name=config.name,
             description=config.description,
             workspace=config.workspace,
@@ -739,10 +707,17 @@ class BeakerLauncher:
             google_credentials_secret=google_credentials_secret,
             mounts=mounts,
             results=config.result_path,
+            install=install_cmd,
             no_python=True,  # Use pre-built image, skip Python setup
-            timeout=0,  # Don't wait for completion
+            dry_run=dry_run,
+            timeout=(
+                99999999 if config.follow else 0
+            ),  # only way to follow the experiment without canceling
             yes=True,  # Skip confirmation prompts
         )
+
+        if dry_run:
+            return None
 
         if workload is None:
             log.warning("Gantry returned None workload - experiment may not have been created")

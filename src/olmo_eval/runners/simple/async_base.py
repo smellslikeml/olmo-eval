@@ -10,7 +10,7 @@ from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from rich.console import Console
 
@@ -34,9 +34,7 @@ from olmo_eval.runners.utils import (
     compute_task_hash,
     generate_experiment_id,
 )
-
-if TYPE_CHECKING:
-    from olmo_eval.storage import StorageBackend
+from olmo_eval.storage import StorageBackend
 
 console = Console()
 logger = get_logger(__name__)
@@ -287,8 +285,6 @@ class AsyncBaseRunner(AsyncRunnerMixin, BaseEvalRunner):
         gpus_per_model = max(0, total_gpus // num_models) if total_gpus > 0 else 0
 
         console.print(f"[bold]Total workers:[/bold] {total_workers}")
-        console.print(f"[bold]Workers per model:[/bold] {workers_per_model}")
-        console.print(f"[bold]GPUs per model:[/bold] {gpus_per_model}")
 
         return model_queues, result_queue, total_workers, workers_per_model, gpus_per_model
 
@@ -412,7 +408,7 @@ class AsyncBaseRunner(AsyncRunnerMixin, BaseEvalRunner):
         for model_name in self.model_names:
             model_config = model_configs[model_name]
             try:
-                provider_type = ProviderType(model_config.provider)
+                provider_type = ProviderType(model_config.get_provider_name())
                 provider_str = provider_type.value
             except ValueError:
                 provider_str = provider_name

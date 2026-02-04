@@ -184,8 +184,13 @@ class JobConfigAssembler:
             return self.eval_config.get_model_resources(m_cfg)
 
         # Extract provider name and package from ProviderConfig
-        provider_name = m_cfg.provider.name if m_cfg.provider else None
-        provider_package = m_cfg.provider.package if m_cfg.provider else None
+        if m_cfg.provider:
+            kind = m_cfg.provider.kind
+            provider_name = kind.value if hasattr(kind, "value") else kind
+            provider_package = m_cfg.provider.package
+        else:
+            provider_name = None
+            provider_package = None
 
         # Model always has gpus and parallelism (default 1)
         return {
@@ -223,6 +228,22 @@ class JobConfigAssembler:
             # Add alias if present
             if m_cfg.alias:
                 command.extend(["--alias", m_cfg.alias])
+
+            # Add provider config if specified
+            if m_cfg.provider:
+                # Get string value (handles both ProviderKind enum and plain strings)
+                kind = m_cfg.provider.kind
+                provider_kind = kind.value if hasattr(kind, "value") else kind
+                command.extend(["--provider", provider_kind])
+                # Pass other provider config fields via overrides
+                from dataclasses import fields
+
+                for f in fields(m_cfg.provider):
+                    if f.name == "kind":
+                        continue  # Already passed via --provider
+                    value = getattr(m_cfg.provider, f.name)
+                    if value:
+                        command.extend(["-o", f"provider.{f.name}={value}"])
 
         # Add tasks with their overrides
         for t in exp.tasks:

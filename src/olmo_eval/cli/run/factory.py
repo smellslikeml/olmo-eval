@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from rich.console import Console
 
+from olmo_eval.cli.run.config import RunConfig
 from olmo_eval.core.types import RunnerType
-
-if TYPE_CHECKING:
-    from olmo_eval.cli.run.config import RunConfig
-    from olmo_eval.runners.models import S3Config
-    from olmo_eval.storage import StorageBackend
+from olmo_eval.runners.models import S3Config
+from olmo_eval.storage import StorageBackend
 
 console = Console()
 
@@ -155,8 +153,9 @@ class RunnerFactory:
         """
         from olmo_eval.runners import SyncEvalRunner
 
-        # Apply per-model provider overrides
-        effective_provider = model_overrides.get("provider", self.config.provider)
+        provider_override = model_overrides.get("provider", self.config.provider)
+        if isinstance(provider_override, dict):
+            provider_override = provider_override.get("name")
         effective_attention_backend = model_overrides.get(
             "attention_backend", self.config.attention_backend
         )
@@ -165,7 +164,7 @@ class RunnerFactory:
             model_name=model_name,
             task_specs=self.config.task_specs,
             output_dir=self.config.output_dir,
-            provider_override=effective_provider,
+            provider_override=provider_override,
             storages=self.storages,
             attention_backend=effective_attention_backend.upper()
             if effective_attention_backend
@@ -239,4 +238,5 @@ class RunnerFactory:
                     runner.run()
                 except Exception as e:
                     console.print(f"\n[bold red]Evaluation failed:[/bold red] {e}")
+                    console.print_exception()
                     raise SystemExit(1) from None

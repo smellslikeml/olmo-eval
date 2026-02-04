@@ -25,6 +25,13 @@ from .base import (
     compute_model_hash,
     compute_task_hash,
 )
+from .literals import (
+    DtypeLiteral,
+    LoadFormatLiteral,
+    PriorityLiteral,
+    ProviderKind,
+    ProviderLiteral,
+)
 from .tools import (
     SEARCH_TOOL_NAMES,
     SEARCH_TOOLS,
@@ -62,6 +69,7 @@ __all__ = [
     "compute_model_hash",
     "compute_task_hash",
     "DatabaseToolType",
+    "DtypeLiteral",
     "EvalResult",
     "ExecutionMetrics",
     "FileSystemToolType",
@@ -73,8 +81,12 @@ __all__ = [
     "list_tool_types",
     "LMOutput",
     "LMRequest",
+    "LoadFormatLiteral",
     "LogProbEntry",
     "MetricName",
+    "PriorityLiteral",
+    "ProviderKind",
+    "ProviderLiteral",
     "register_tool_type",
     "ReliabilityMetrics",
     "RequestType",

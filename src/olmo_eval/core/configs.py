@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from olmo_eval.core.constants.infrastructure import BEAKER_RESULT_DIR
-from olmo_eval.core.literals import DtypeLiteral, ProviderLiteral
+from olmo_eval.core.types import DtypeLiteral, ProviderKind
+from olmo_eval.launch.config import ProviderConfig
 
 
 @dataclass
@@ -26,7 +27,7 @@ class ModelConfig:
 
     model: str
     tokenizer: str | None = None  # Tokenizer path/identifier, defaults to model if None
-    provider: ProviderLiteral = "vllm"
+    provider: ProviderConfig = field(default_factory=lambda: ProviderConfig(kind=ProviderKind.VLLM))
     revision: str | None = None
     trust_remote_code: bool = False
     dtype: DtypeLiteral = "auto"
@@ -35,6 +36,38 @@ class ModelConfig:
     # API endpoint for OpenAI-compatible APIs (agent tasks only)
     # When set, agent tasks use this URL directly instead of starting vLLM
     model_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.provider, dict):
+            provider_dict = cast(dict[str, Any], self.provider)
+            kind = provider_dict.get("kind", "vllm")
+            if isinstance(kind, str):
+                kind = ProviderKind(kind)
+            object.__setattr__(
+                self,
+                "provider",
+                ProviderConfig(
+                    kind=kind,
+                    package=provider_dict.get("package"),
+                    max_concurrency=provider_dict.get("max_concurrency"),
+                    required_secrets=tuple(provider_dict.get("required_secrets", ())),
+                ),
+            )
+
+    def get_provider_name(self, override: str | None = None) -> str:
+        """Get the effective provider name as a string.
+
+        Args:
+            override: Optional provider name override. If provided, this takes
+                precedence over the configured provider.
+
+        Returns:
+            Provider name string (e.g., "vllm", "litellm", "hf").
+        """
+        if override:
+            return override
+        kind = self.provider.kind
+        return str(kind.value) if hasattr(kind, "value") else str(kind)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dictionary for JSON output."""

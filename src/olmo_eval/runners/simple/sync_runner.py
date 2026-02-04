@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from rich.console import Console
 from rich.table import Table
@@ -24,9 +24,7 @@ from olmo_eval.runners.utils import (
     generate_experiment_id,
     run_task_impl,
 )
-
-if TYPE_CHECKING:
-    from olmo_eval.storage import StorageBackend
+from olmo_eval.storage import StorageBackend
 
 console = Console()
 logger = get_logger(__name__)
@@ -91,7 +89,7 @@ class SyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
         table.add_column("Value", style="white")
 
         model_config = get_model_config(self.model_name, **self.model_overrides)
-        provider_str = self.provider_override or model_config.provider
+        provider_str = model_config.get_provider_name(self.provider_override)
 
         table.add_row("Model", model_config.model)
         if model_config.tokenizer:
@@ -122,8 +120,8 @@ class SyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
 
         model_config = get_model_config(self.model_name, **self.model_overrides)
 
-        # Determine provider (model_config.provider is a string)
-        provider_str = self.provider_override or model_config.provider
+        # Determine provider
+        provider_str = model_config.get_provider_name(self.provider_override)
         provider_type = ProviderType(provider_str)
 
         # Expand tasks first
@@ -157,6 +155,11 @@ class SyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
             extra_kwargs["load_format"] = self.model_overrides["load_format"]
         if self.model_overrides.get("extra_loader_config"):
             extra_kwargs["model_loader_extra_config"] = self.model_overrides["extra_loader_config"]
+
+        # API concurrency from provider config (for litellm and other API-based providers)
+        provider_config = self.model_overrides.get("provider", {})
+        if isinstance(provider_config, dict) and provider_config.get("max_concurrency"):
+            extra_kwargs["max_concurrency"] = provider_config["max_concurrency"]
 
         # Track provider init time
         provider_init_start = time.time()
