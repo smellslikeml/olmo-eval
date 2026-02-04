@@ -40,10 +40,9 @@ class MinervaMathTask(Task):
         return self.config.get_data_source(split=split)
 
     def process_doc(self, doc: dict[str, Any], index: int = 0) -> Instance | None:
-        solution_text = doc.get("solution", "")
+        solution_text = doc["solution"]
         extracted_answers = MathExtractor.extract_answer(solution_text)
 
-        # Use first as primary gold_answer for backward compatibility
         primary_answer = extracted_answers[0] if extracted_answers else None
         all_gold_answers = extracted_answers if extracted_answers else []
 
@@ -80,18 +79,11 @@ class Math500Task(MinervaMathTask):
         return self.config.get_data_source(split=split)
 
     def process_doc(self, doc: dict[str, Any], index: int = 0) -> Instance | None:
-        # MATH-500 provides the answer directly
-        gold_answer = doc.get("answer")
-        all_gold_answers: list[str] = []
+        solution_text = doc["solution"]
+        extracted_answers = MathExtractor.extract_answer(solution_text)
 
-        if gold_answer is not None:
-            all_gold_answers = [gold_answer]
-        else:
-            # Fall back to extraction from solution
-            solution_text = doc.get("solution", "")
-            extracted_answers = MathExtractor.extract_answer(solution_text)
-            gold_answer = extracted_answers[0] if extracted_answers else None
-            all_gold_answers = extracted_answers if extracted_answers else []
+        gold_answer = extracted_answers[0] if extracted_answers else None
+        all_gold_answers = extracted_answers if extracted_answers else []
 
         return Instance(
             question=doc["problem"],
@@ -99,7 +91,7 @@ class Math500Task(MinervaMathTask):
             metadata={
                 "level": doc.get("level"),
                 "type": doc.get("type", doc.get("subject")),
-                "solution_text": doc.get("solution", ""),
+                "solution_text": doc.get("solution"),
                 "all_gold_answers": all_gold_answers,
             },
         )
@@ -120,7 +112,8 @@ def _minerva_math_config(subset: str) -> TaskConfig:
         num_fewshot=4,
         sampling_params=SamplingParams(
             max_tokens=1024,
-            temperature=0.7,
+            temperature=0,
+            stop_sequences=["Problem:", "\n\n"]
         ),
     )
 
@@ -137,7 +130,8 @@ def _math500_config() -> TaskConfig:
         num_fewshot=4,
         sampling_params=SamplingParams(
             max_tokens=1024,
-            temperature=0.7,
+            temperature=0,
+            stop_sequences=["Problem:", "\n\n"]
         ),
     )
 
