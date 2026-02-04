@@ -192,10 +192,30 @@ def get_model_config(name: str, **overrides: Any) -> ModelConfig:
     if name in models:
         base = models[name]
         if filtered_overrides:
+            # Merge partial provider overrides with the base preset's provider config
+            # so that e.g. `-o provider.max_concurrency=32` preserves kind=litellm
+            provider_raw = filtered_overrides.get("provider", base.provider)
+            if isinstance(provider_raw, dict):
+                base_provider = base.provider
+                kind_raw = provider_raw.get("kind", base_provider.kind)
+                kind = ProviderKind(kind_raw) if isinstance(kind_raw, str) else kind_raw
+                provider_value: ProviderConfig = ProviderConfig(
+                    kind=kind,
+                    package=provider_raw.get("package", base_provider.package),
+                    max_concurrency=provider_raw.get(
+                        "max_concurrency", base_provider.max_concurrency
+                    ),
+                    required_secrets=tuple(
+                        provider_raw.get("required_secrets", base_provider.required_secrets)
+                    ),
+                )
+            else:
+                provider_value = provider_raw
+
             return ModelConfig(
                 model=filtered_overrides.get("model", base.model),
                 tokenizer=filtered_overrides.get("tokenizer", base.tokenizer),
-                provider=filtered_overrides.get("provider", base.provider),
+                provider=provider_value,
                 revision=filtered_overrides.get("revision", base.revision),
                 trust_remote_code=filtered_overrides.get(
                     "trust_remote_code", base.trust_remote_code
