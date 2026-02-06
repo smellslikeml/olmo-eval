@@ -219,8 +219,8 @@ def minerva_is_equiv(x1: str, x2: str) -> bool:
     except TimeoutError:
         log.debug(f"Timed out comparing {x1} and {x2}")
     except ImportError as e:
-        log.error(e)
-        raise
+        # antlr4 not installed (required by sympy parse_latex); fall back to hendrycks in is_equiv
+        log.debug("LaTeX parsing unavailable (%s); using string equivalence only", e)
     except Exception as e:
         log.debug(f"Failed comparing {x1} and {x2} with {e}")
     return False

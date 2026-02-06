@@ -36,6 +36,10 @@ Repository = "https://github.com/allenai/olmo-eval"
 Issues = "https://github.com/allenai/olmo-eval/issues"
 
 [project.optional-dependencies]
+# Minerva-style math equivalence (sympy parse_latex). Without it, math tasks use Hendrycks string match only.
+math_latex = [
+    "antlr4-python3-runtime>=4.11,<4.12",
+]
 hf = [
     "transformers~=4.57.3",
 ]
