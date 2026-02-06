@@ -76,9 +76,14 @@ class MathExtractor:
 
 
 def is_equiv(gen, correct):
-    """Math equivalence: try sympy (Minerva) first, then Hendrycks string match."""
-    if minerva_is_equiv(gen, correct):
-        return True
+    """Math equivalence: try sympy (Minerva) first, then Hendrycks string match.
+    On any exception or timeout in sympy, fall back to Hendrycks so we match oe-eval behavior.
+    """
+    try:
+        if minerva_is_equiv(gen, correct):
+            return True
+    except Exception:
+        pass
     return hendrycks_is_equiv(gen, correct)
 
 

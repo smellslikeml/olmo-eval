@@ -152,7 +152,7 @@ def _minerva_math_config(subset: str) -> TaskConfig:
             subset=subset,
         ),
         formatter=CompletionFormatter(
-            template="Problem:\n{question}\n\nSolution:",  # match oe-eval minerva style
+            template="Problem:\n{question}\n\nSolution: ",  # space after colon matches oe-eval doc_to_target " " + solution
             fewshot_answer_key="solution_text",
         ),
         metrics=(AccuracyMetric(scorer=MinervaMathScorer),),
@@ -168,7 +168,7 @@ def _math500_config() -> TaskConfig:
         name="math500",
         data_source=DataSource(path="HuggingFaceH4/MATH-500"),
         formatter=CompletionFormatter(
-            template="Problem:\n{question}\n\nSolution:",  # match oe-eval minerva style
+            template="Problem:\n{question}\n\nSolution: ",  # space after colon matches oe-eval
             fewshot_answer_key="solution_text",
         ),
         metrics=(AccuracyMetric(scorer=MinervaMathScorer),),
