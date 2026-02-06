@@ -371,11 +371,11 @@ def run_task_impl(
         else:
             outputs = provider.generate(requests, task.config.sampling_params)
 
-        # Build responses
-        responses = [
-            Response(instance=inst, request=req, outputs=out)
-            for inst, req, out in zip(instances, requests, outputs, strict=True)
-        ]
+        # Build responses: one Response per (instance, output) so PassAtK etc. see n samples per instance
+        responses = []
+        for inst, req, out_list in zip(instances, requests, outputs, strict=True):
+            for out in out_list:
+                responses.append(Response(instance=inst, request=req, outputs=[out]))
 
         # Score and compute metrics
         scored = task.score_responses(responses)
