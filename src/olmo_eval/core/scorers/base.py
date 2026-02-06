@@ -267,6 +267,38 @@ class ExactMatchFlexScorer(Scorer):
 
 
 @dataclass(frozen=True, slots=True)
+class MinervaMathScorer(Scorer):
+    """Flexible math equivalence: any extracted answer vs any gold, using sympy + Hendrycks.
+
+    Matches oe-eval Minerva MATH behavior: try sympy (minerva_is_equiv) then
+    Hendrycks string normalization. Expects instance.metadata["all_gold_answers"]
+    and output.metadata["all_extracted_answers"]; falls back to single gold/extracted.
+    """
+
+    name: str = "minerva_math_flex"
+
+    def score(self, instance: Instance, output: LMOutput) -> float:
+        from olmo_eval.evals.extract.math import is_equiv
+
+        all_gold = instance.metadata.get("all_gold_answers", [])
+        if not all_gold and instance.gold_answer is not None:
+            all_gold = [instance.gold_answer]
+
+        all_extracted = (output.metadata or {}).get("all_extracted_answers", [])
+        if not all_extracted and output.extracted_answer is not None:
+            all_extracted = [output.extracted_answer]
+
+        if not all_gold or not all_extracted:
+            return 0.0
+
+        for extracted in all_extracted:
+            for gold in all_gold:
+                if is_equiv(str(extracted).strip(), str(gold).strip()):
+                    return 1.0
+        return 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class MathVerifyScorer(Scorer):
     """Score math answers using symbolic verification via math_verify library.
 

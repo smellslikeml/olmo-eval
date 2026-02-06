@@ -76,7 +76,10 @@ class MathExtractor:
 
 
 def is_equiv(gen, correct):
-    return hendrycks_is_equiv(gen, correct)  # or minerva_is_equiv(gen, correct)
+    """Math equivalence: try sympy (Minerva) first, then Hendrycks string match."""
+    if minerva_is_equiv(gen, correct):
+        return True
+    return hendrycks_is_equiv(gen, correct)
 
 
 def extract_math_answer(result: str) -> list[str]:
