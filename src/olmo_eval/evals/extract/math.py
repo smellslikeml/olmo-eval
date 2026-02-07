@@ -196,13 +196,14 @@ class timeout:
 
 def minerva_is_equiv(x1: str, x2: str) -> bool:
     """
-    x1 and x2 are normalized latex string
+    x1 and x2 are normalized latex string.
+    Uses sympy parse_latex with backend="lark" (no antlr4 dependency; compatible with omegaconf).
     """
     try:
         with timeout(seconds=5):
             try:
-                parsed_x1 = parse_latex(x1)
-                parsed_x2 = parse_latex(x2)
+                parsed_x1 = parse_latex(x1, backend="lark")
+                parsed_x2 = parse_latex(x2, backend="lark")
             except (
                 sympy.parsing.latex.errors.LaTeXParsingError,
                 sympy.SympifyError,
@@ -224,7 +225,6 @@ def minerva_is_equiv(x1: str, x2: str) -> bool:
     except TimeoutError:
         log.debug(f"Timed out comparing {x1} and {x2}")
     except ImportError as e:
-        # antlr4 not installed (required by sympy parse_latex); fall back to hendrycks in is_equiv
         log.debug("LaTeX parsing unavailable (%s); using string equivalence only", e)
     except Exception as e:
         log.debug(f"Failed comparing {x1} and {x2} with {e}")
