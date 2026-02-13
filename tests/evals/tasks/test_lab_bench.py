@@ -13,22 +13,36 @@ def _setup_registry():
     import olmo_eval.evals.tasks  # noqa: F401
 
 
+_ALL_TASKS = (
+    "lab_bench_litqa2",
+    "lab_bench_dbqa",
+    "lab_bench_seqqa",
+    "lab_bench_protocolqa",
+    "lab_bench_suppqa",
+    "lab_bench_cloning_scenarios",
+)
+
+
 class TestLabBenchRegistration:
     """Tests for LAB-Bench task registration."""
 
-    def test_litqa2_registered(self):
-        assert "lab_bench_litqa2" in list_tasks()
+    @pytest.mark.parametrize("task_name", _ALL_TASKS)
+    def test_task_registered(self, task_name):
+        assert task_name in list_tasks()
 
-    def test_get_litqa2(self):
-        task = get_task("lab_bench_litqa2")
-        assert task.config.name == "lab_bench_litqa2"
+    @pytest.mark.parametrize("task_name", _ALL_TASKS)
+    def test_get_task(self, task_name):
+        task = get_task(task_name)
+        assert task.config.name == task_name
 
-    def test_litqa2_mc_variant(self):
-        task = get_task("lab_bench_litqa2:mc")
+    @pytest.mark.parametrize("task_name", _ALL_TASKS)
+    def test_mc_variant(self, task_name):
+        task = get_task(f"{task_name}:mc")
         assert task is not None
 
-    def test_litqa2_bpb_variant(self):
-        task = get_task("lab_bench_litqa2:bpb")
+    @pytest.mark.parametrize("task_name", _ALL_TASKS)
+    def test_bpb_variant(self, task_name):
+        task = get_task(f"{task_name}:bpb")
         assert task is not None
 
 
@@ -43,17 +57,17 @@ class TestProcessDoc:
         doc = {
             "question": "What enzyme catalyzes X?",
             "ideal": "Kinase A",
-            "distractors": ["Kinase B", "Kinase C", "Insufficient information"],
+            "distractors": ["Kinase B", "Kinase C"],
         }
         instance = task.process_doc(doc, index=0)
 
         assert instance is not None
         assert instance.question == "What enzyme catalyzes X?"
-        assert len(instance.choices) == 4
+        assert len(instance.choices) == 4  # ideal + 2 distractors + refuse
         assert "Kinase A" in instance.choices
         assert "Kinase B" in instance.choices
         assert "Kinase C" in instance.choices
-        assert "Insufficient information" in instance.choices
+        assert "Insufficient information to answer the question" in instance.choices
 
     def test_gold_letter_points_to_ideal(self, task):
         doc = {
@@ -88,27 +102,6 @@ class TestProcessDoc:
         inst1 = task.process_doc(doc, index=1)
         assert inst0.choices != inst1.choices
 
-    def test_injects_insufficient_info_option(self, task):
-        doc = {
-            "question": "Q?",
-            "ideal": "Answer",
-            "distractors": ["Wrong 1", "Wrong 2"],
-        }
-        instance = task.process_doc(doc, index=0)
-        assert any("insufficient" in c.lower() for c in instance.choices)
-        assert len(instance.choices) == 4  # ideal + 2 distractors + injected
-
-    def test_skips_injection_when_already_present(self, task):
-        doc = {
-            "question": "Q?",
-            "ideal": "Answer",
-            "distractors": ["Wrong", "Insufficient information to answer"],
-        }
-        instance = task.process_doc(doc, index=0)
-        insuff_count = sum(1 for c in instance.choices if "insufficient" in c.lower())
-        assert insuff_count == 1
-        assert len(instance.choices) == 3  # ideal + 2 distractors, no injection
-
     def test_deduplicates_ideal_in_distractors(self, task):
         doc = {
             "question": "Q?",
@@ -117,7 +110,7 @@ class TestProcessDoc:
         }
         instance = task.process_doc(doc, index=0)
         assert instance.choices.count("Same") == 1
-        assert len(instance.choices) == 3  # deduped ideal + 1 distractor + injected
+        assert len(instance.choices) == 3  # "Same" + "Different" + refuse option
 
     def test_metadata_contains_gold_idx_and_text(self, task):
         doc = {
@@ -129,15 +122,15 @@ class TestProcessDoc:
         assert "gold_idx" in instance.metadata
         assert instance.metadata["gold_text"] == "The right answer"
 
-    def test_metadata_contains_unsure_idx(self, task):
+    def test_metadata_contains_refuse_idx(self, task):
         doc = {
             "question": "Q?",
             "ideal": "Answer",
             "distractors": ["Wrong 1", "Wrong 2"],
         }
         instance = task.process_doc(doc, index=0)
-        unsure_idx = instance.metadata["unsure_idx"]
-        assert instance.choices[unsure_idx] == "Insufficient information to answer the question"
+        refuse_idx = instance.metadata["refuse_idx"]
+        assert instance.choices[refuse_idx] == "Insufficient information to answer the question"
 
     def test_skip_missing_question(self, task):
         doc = {"question": "", "ideal": "Answer", "distractors": ["D1"]}
@@ -146,6 +139,35 @@ class TestProcessDoc:
     def test_skip_missing_ideal(self, task):
         doc = {"question": "Q?", "ideal": "", "distractors": ["D1"]}
         assert task.process_doc(doc, index=0) is None
+
+
+class TestProtocolQAProcessDoc:
+    """Tests for ProtocolQA protocol injection."""
+
+    @pytest.fixture
+    def task(self):
+        return get_task("lab_bench_protocolqa")
+
+    def test_protocol_prepended_to_question(self, task):
+        doc = {
+            "question": "What went wrong?",
+            "ideal": "Step 3 was skipped",
+            "distractors": ["Step 1 was skipped"],
+            "protocol": "Step 1: Mix reagents\nStep 2: Incubate\nStep 3: Centrifuge",
+        }
+        instance = task.process_doc(doc, index=0)
+        assert "Protocol:" in instance.question
+        assert "Step 1: Mix reagents" in instance.question
+        assert "Question: What went wrong?" in instance.question
+
+    def test_missing_protocol_uses_question_only(self, task):
+        doc = {
+            "question": "What went wrong?",
+            "ideal": "Unknown",
+            "distractors": ["Nothing"],
+        }
+        instance = task.process_doc(doc, index=0)
+        assert instance.question == "What went wrong?"
 
 
 class TestExtractAnswer:
@@ -214,24 +236,21 @@ class TestFormatRequest:
 
 
 class TestPrecisionMetric:
-    """Tests for PrecisionMetric (accuracy excluding abstentions)."""
+    """Tests for PrecisionMetric (accuracy excluding refusals)."""
 
     @pytest.fixture
     def metric(self):
         return PrecisionMetric()
 
     def _make_response(
-        self, gold: str, extracted: str, score: float, unsure_idx: int | None = None
+        self, gold: str, extracted: str, score: float, refuse_idx: int = 2
     ) -> Response:
-        metadata: dict = {"gold_idx": 0, "gold_text": "Answer"}
-        if unsure_idx is not None:
-            metadata["unsure_idx"] = unsure_idx
         return Response(
             instance=Instance(
                 question="Q?",
                 gold_answer=gold,
                 choices=("A", "B", "C"),
-                metadata=metadata,
+                metadata={"gold_idx": 0, "gold_text": "Answer", "refuse_idx": refuse_idx},
             ),
             request=LMRequest(request_type=RequestType.CHAT, messages=()),
             outputs=[LMOutput(text="", extracted_answer=extracted)],
@@ -239,37 +258,29 @@ class TestPrecisionMetric:
         )
 
     def test_all_committed(self, metric):
-        """No abstentions: precision == accuracy."""
+        """No refusals: precision == accuracy."""
         responses = [
-            self._make_response("A", "A", 1.0, unsure_idx=2),
-            self._make_response("A", "B", 0.0, unsure_idx=2),
+            self._make_response("A", "A", 1.0),
+            self._make_response("A", "B", 0.0),
         ]
         assert metric.compute(responses) == pytest.approx(0.5)
 
-    def test_abstention_excluded(self, metric):
-        """Abstained response excluded from denominator."""
+    def test_refusal_excluded(self, metric):
+        """Refused response excluded from denominator."""
         responses = [
-            self._make_response("A", "A", 1.0, unsure_idx=2),  # correct
-            self._make_response("A", "C", 0.0, unsure_idx=2),  # abstained (chose C = unsure)
+            self._make_response("A", "A", 1.0),  # correct
+            self._make_response("A", "C", 0.0),  # refused (chose C = refuse option)
         ]
         # Only 1 committed response, and it's correct
         assert metric.compute(responses) == pytest.approx(1.0)
 
-    def test_all_abstained(self, metric):
-        """All responses abstained: returns 0.0."""
+    def test_all_refused(self, metric):
+        """All responses refused: returns 0.0."""
         responses = [
-            self._make_response("A", "C", 0.0, unsure_idx=2),
-            self._make_response("A", "C", 0.0, unsure_idx=2),
+            self._make_response("A", "C", 0.0),
+            self._make_response("A", "C", 0.0),
         ]
         assert metric.compute(responses) == pytest.approx(0.0)
 
     def test_empty_responses(self, metric):
         assert metric.compute([]) == pytest.approx(0.0)
-
-    def test_no_unsure_idx_in_metadata(self, metric):
-        """When unsure_idx is absent, all responses count as committed."""
-        responses = [
-            self._make_response("A", "A", 1.0, unsure_idx=None),
-            self._make_response("A", "B", 0.0, unsure_idx=None),
-        ]
-        assert metric.compute(responses) == pytest.approx(0.5)

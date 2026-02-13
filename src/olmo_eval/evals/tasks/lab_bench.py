@@ -1,17 +1,18 @@
 """LAB-Bench evaluation tasks.
 
 LAB-Bench (futurehouse/lab-bench) is a biology research benchmark with 8 subtasks.
-This module implements the text-only subtasks, starting with LitQA2.
+This module implements the 6 text-only subtasks. The 2 image-based subtasks
+(FigQA, TableQA) are deferred until the framework supports multimodal inputs.
 
-Usage:
-    # Chat-based generation (default)
-    olmo-eval run -m llama3.1-8b -t lab_bench_litqa2
+Subtasks:
+    lab_bench_litqa2            LitQA2 — literature-based QA (199 questions)
+    lab_bench_dbqa              DbQA — biological database QA (520 questions)
+    lab_bench_seqqa             SeqQA — DNA/protein sequence analysis (600 questions)
+    lab_bench_protocolqa        ProtocolQA — lab protocol QA (108 questions)
+    lab_bench_suppqa            SuppQA — supplementary material QA (82 questions)
+    lab_bench_cloning_scenarios CloningScenarios — molecular cloning (33 questions)
 
-    # Logprob-based multiple choice
-    olmo-eval run -m llama3.1-8b -t lab_bench_litqa2:mc
-
-    # Bits-per-byte perplexity
-    olmo-eval run -m llama3.1-8b -t lab_bench_litqa2:bpb
+Each task supports :mc (logprob-based) and :bpb (bits-per-byte) variants.
 """
 
 from __future__ import annotations
@@ -45,11 +46,11 @@ _REFUSE_CHOICE = "Insufficient information to answer the question"
 
 @dataclass(frozen=True, slots=True)
 class PrecisionMetric(Metric):
-    """Accuracy excluding abstentions (correct / non-abstained).
+    """Accuracy excluding refusals (correct / non-refused).
 
     Matches the "precision" metric from the LAB-Bench evaluation protocol.
-    A response is an abstention if the model chose the refuse option
-    (identified by `unsure_idx` in instance metadata).
+    A response is a refusal if the model chose the refuse option
+    (identified by `refuse_idx` in instance metadata).
     """
 
     name: str = "precision"
@@ -62,12 +63,10 @@ class PrecisionMetric(Metric):
         committed = 0
         correct = 0.0
         for r in responses:
-            unsure_idx = r.instance.metadata.get("unsure_idx")
-            if unsure_idx is not None:
-                unsure_letter = chr(ord("A") + unsure_idx)
-                extracted = r.outputs[0].extracted_answer if r.outputs else None
-                if extracted is not None and str(extracted).strip().upper() == unsure_letter:
-                    continue
+            refuse_letter = chr(ord("A") + r.instance.metadata["refuse_idx"])
+            extracted = r.outputs[0].extracted_answer if r.outputs else None
+            if extracted is not None and extracted.strip().upper() == refuse_letter:
+                continue
             committed += 1
             correct += r.scores.get(scorer_name, 0.0)
         return correct / committed if committed > 0 else 0.0
@@ -104,33 +103,24 @@ class LabBenchTask(Task):
         # Build choices: ideal + distractors (deduplicate in case ideal appears in distractors)
         choices = [ideal] + [d for d in distractors if d != ideal]
 
-        # Inject abstention option if not already present (the HF dataset omits it,
-        # but the LAB-Bench evaluation protocol includes it)
-        if not any("insufficient" in c.lower() for c in choices):
-            choices.append(_REFUSE_CHOICE)
+        # Inject refuse option per the LAB-Bench evaluation protocol
+        choices.append(_REFUSE_CHOICE)
 
         # Deterministic per-question shuffle
         rng = random.Random(f"{self.config.seed}:{index}")
         rng.shuffle(choices)
 
-        # Find where the ideal and refuse options landed after shuffle
         gold_idx = choices.index(ideal)
         gold_letter = chr(ord("A") + gold_idx)
-
-        # Find the refuse option index (may not exist if one was already in distractors)
-        try:
-            unsure_idx = choices.index(_REFUSE_CHOICE)
-        except ValueError:
-            unsure_idx = None
+        refuse_idx = choices.index(_REFUSE_CHOICE)
 
         metadata: dict[str, Any] = {
             "id": doc.get("id", f"lab_bench_{index}"),
             "index": index,
             "gold_idx": gold_idx,
             "gold_text": ideal,
+            "refuse_idx": refuse_idx,
         }
-        if unsure_idx is not None:
-            metadata["unsure_idx"] = unsure_idx
 
         return Instance(
             question=question,
@@ -154,55 +144,86 @@ class LabBenchTask(Task):
         )
 
     def extract_answer(self, output: LMOutput) -> str | None:
-        """Extract a letter answer from model output.
-
-        Looks for the "ANSWER: X" pattern that the system prompt requests.
-        Returns None if the model doesn't follow the expected format.
-        """
-        text = output.text.strip()
-        if not text:
-            return None
-
-        matches = list(_ANSWER_PATTERN.finditer(text))
-        if matches:
-            return matches[-1].group(1).upper()
-
-        return None
+        """Extract the last ``ANSWER: X`` letter from model output."""
+        matches = list(_ANSWER_PATTERN.finditer(output.text))
+        return matches[-1].group(1).upper() if matches else None
 
 
-LITQA2_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT = """\
 You are a scientific research assistant. Answer the following multiple choice \
 question by reasoning through the options and selecting the best answer.
 
 End your response with "ANSWER: X" where X is the letter of your chosen answer."""
 
+_DEFAULT_METRICS = (AccuracyMetric(scorer=MultipleChoiceScorer), PrecisionMetric())
+_DEFAULT_SAMPLING = SamplingParams(temperature=0.0, max_tokens=1024)
 
-@register("lab_bench_litqa2")
-class LabBenchLitQA2(LabBenchTask):
-    """LitQA2: Literature-based question answering from LAB-Bench."""
 
-    data_source = DataSource(path="futurehouse/lab-bench", subset="LitQA2", split="train")
-    formatter = MCQAChatFormatter(system_prompt=LITQA2_SYSTEM_PROMPT)
-    metrics = (AccuracyMetric(scorer=MultipleChoiceScorer), PrecisionMetric())
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=1024)
+# =============================================================================
+# Task Registrations
+# =============================================================================
+
+
+# Subtasks that use LabBenchTask directly (question field is self-contained)
+_STANDARD_SUBTASKS: dict[str, str] = {
+    "lab_bench_litqa2": "LitQA2",
+    "lab_bench_dbqa": "DbQA",
+    "lab_bench_seqqa": "SeqQA",
+    "lab_bench_suppqa": "SuppQA",
+    "lab_bench_cloning_scenarios": "CloningScenarios",
+}
+
+for _name, _subset in _STANDARD_SUBTASKS.items():
+    _cls = type(
+        _subset,
+        (LabBenchTask,),
+        {
+            "data_source": DataSource(path="futurehouse/lab-bench", subset=_subset, split="train"),
+            "formatter": MCQAChatFormatter(system_prompt=_SYSTEM_PROMPT),
+            "metrics": _DEFAULT_METRICS,
+            "sampling_params": _DEFAULT_SAMPLING,
+        },
+    )
+    register(_name)(_cls)
+
+
+@register("lab_bench_protocolqa")
+class LabBenchProtocolQA(LabBenchTask):
+    """ProtocolQA: Lab protocol question answering from LAB-Bench.
+
+    Prepends the protocol text to the question, since questions reference
+    "the listed protocol" which is stored in a separate dataset field.
+    """
+
+    data_source = DataSource(path="futurehouse/lab-bench", subset="ProtocolQA", split="train")
+    formatter = MCQAChatFormatter(system_prompt=_SYSTEM_PROMPT)
+    metrics = _DEFAULT_METRICS
+    sampling_params = _DEFAULT_SAMPLING
+
+    def process_doc(self, doc: dict[str, Any], index: int = 0) -> Instance | None:
+        protocol = doc.get("protocol", "")
+        if protocol:
+            question = doc.get("question", "")
+            doc = {**doc, "question": f"Protocol:\n{protocol}\n\nQuestion: {question}"}
+        return super().process_doc(doc, index)
 
 
 # =============================================================================
 # Variant Registrations
 # =============================================================================
 
-# Logprob-based multiple choice
-register_variant(
-    "lab_bench_litqa2",
-    "mc",
-    formatter=MultipleChoiceFormatter(),
-    metrics=(AccuracyMetric(scorer=MultipleChoiceScorer), PrecisionMetric()),
-)
+_ALL_TASKS = (*_STANDARD_SUBTASKS, "lab_bench_protocolqa")
 
-# Bits-per-byte perplexity
-register_variant(
-    "lab_bench_litqa2",
-    "bpb",
-    formatter=PPLFormatter(),
-    metrics=(BPBMetric(),),
-)
+for _task in _ALL_TASKS:
+    register_variant(
+        _task,
+        "mc",
+        formatter=MultipleChoiceFormatter(),
+        metrics=_DEFAULT_METRICS,
+    )
+    register_variant(
+        _task,
+        "bpb",
+        formatter=PPLFormatter(),
+        metrics=(BPBMetric(),),
+    )
