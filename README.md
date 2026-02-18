@@ -749,7 +749,7 @@ Use the `-o/--override` flag to apply configuration overrides to the preceding `
 ```bash
 # Model overrides (apply to the preceding -m)
 olmo-eval beaker launch -n "eval" \
-    -m llama3.1-8b -o provider.kind=vllm -o provider.package=vllm==0.14.0 \
+    -m llama3.1-8b -o provider.kind=vllm -o 'provider.dependencies=[vllm==0.14.0]' \
     -m gpt-4o -o provider.kind=litellm \
     -t mmlu -t gsm8k
 
@@ -774,7 +774,7 @@ The `-o` flag uses OmegaConf dotlist syntax, supporting:
 | String | `key=value` | `-o provider.kind=vllm` |
 | Number | `key=123` | `-o limit=100` |
 | Boolean | `key=true` | `-o preemptible=false` |
-| Nested | `a.b.c=val` | `-o provider.package=vllm==0.14.0` |
+| Nested | `a.b.c=val` | `-o provider.base_url=http://...` |
 | List | `key=[a,b]` | `-o 'args=[--flag1, --flag2]'` |
 | Dict | `key={a: 1}` | `-o 'config={distributed: true}'` |
 
@@ -1119,7 +1119,19 @@ JSON output includes pagination metadata:
 
 ### Database Configuration
 
-Configure via environment variables:
+#### AI2 Users (Recommended)
+
+Set these two environment variables to connect to the shared database:
+
+```bash
+export OLMO_EVAL_DB_HOST="<database-host>"
+export OLMO_EVAL_DB_SECRET_ARN="arn:aws:secretsmanager:us-west-2:..."
+```
+
+The password is automatically fetched from AWS Secrets Manager on first connection.
+This requires AWS credentials configured (via `~/.aws/credentials` or environment variables).
+
+#### All Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1127,7 +1139,8 @@ Configure via environment variables:
 | `OLMO_EVAL_DB_PORT` | `5432` | Database port |
 | `OLMO_EVAL_DB_NAME` | `olmo_eval` | Database name |
 | `OLMO_EVAL_DB_USER` | `postgres` | Database user |
-| `OLMO_EVAL_DB_PASSWORD` | `postgres` | Database password |
+| `OLMO_EVAL_DB_PASSWORD` | - | Database password (use this OR `OLMO_EVAL_DB_SECRET_ARN`) |
+| `OLMO_EVAL_DB_SECRET_ARN` | - | AWS Secrets Manager ARN for password (fetched on auth failure) |
 
 ## Advanced Usage
 

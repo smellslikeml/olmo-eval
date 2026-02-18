@@ -9,12 +9,33 @@ from olmo_eval.common.constants.infrastructure import (
     BEAKER_RESULT_DIR,
     cluster_has_weka,
 )
+from olmo_eval.launch.beaker.constants import BEAKER_INFRA_ENV_VARS
 from olmo_eval.launch.beaker.mirror import log
 
 if TYPE_CHECKING:
     from olmo_eval.cli.beaker.config_loader import LaunchConfig
     from olmo_eval.cli.beaker.experiment_plan import ExperimentPlan
     from olmo_eval.launch import BeakerJobConfig
+
+
+def get_provider_kind(model_spec: str, default_kind: str | None = None) -> str | None:
+    """Get the provider kind for a model.
+
+    Args:
+        model_spec: Model name or path.
+        default_kind: Default provider kind if model is not a preset or has no kind.
+
+    Returns:
+        Provider kind string (e.g., "vllm", "vllm_server", "litellm") or None.
+    """
+    from olmo_eval.common.configs import get_provider_config
+
+    try:
+        provider_config = get_provider_config(model_spec)
+        # Fall back to default_kind if config has no kind set
+        return provider_config.kind or default_kind
+    except Exception:
+        return default_kind
 
 
 def get_provider_extras(model_spec: str, default_kind: str | None = None) -> list[str]:
@@ -27,20 +48,72 @@ def get_provider_extras(model_spec: str, default_kind: str | None = None) -> lis
     Returns:
         List of pip extras needed for the provider.
     """
-    from olmo_eval.common.configs import get_provider_config
     from olmo_eval.common.constants.infrastructure import BACKEND_OPTIONAL_GROUPS
 
-    try:
-        provider_config = get_provider_config(model_spec)
-        provider_kind = provider_config.kind
-    except Exception:
-        provider_kind = default_kind
+    provider_kind = get_provider_kind(model_spec, default_kind)
 
     if provider_kind:
         provider_extra = BACKEND_OPTIONAL_GROUPS.get(provider_kind)
         if provider_extra:
             return [provider_extra]
     return []
+
+
+def get_provider_dependencies(model_spec: str) -> list[str]:
+    """Get runtime dependencies from a model's provider config.
+
+    Args:
+        model_spec: Model name or path.
+
+    Returns:
+        List of package specifiers to install.
+    """
+    from olmo_eval.common.configs import get_provider_config
+
+    try:
+        provider_config = get_provider_config(model_spec)
+        return list(provider_config.dependencies)
+    except Exception:
+        return []
+
+
+def collect_install_extras(
+    *,
+    store: bool = False,
+    sandbox: bool = False,
+    backend_name: str | None = None,
+    provider_extras: list[str] | None = None,
+) -> list[str]:
+    """Collect pip extras needed for a job.
+
+    Args:
+        store: Whether storage is enabled.
+        sandbox: Whether sandbox is enabled.
+        backend_name: Harness backend name (e.g., "openai_agents").
+        provider_extras: Provider-specific extras.
+
+    Returns:
+        List of pip extras to install.
+    """
+    extras: list[str] = []
+
+    if store:
+        extras.append("storage")
+    if sandbox:
+        extras.append("sandbox")
+
+    if backend_name:
+        from olmo_eval.harness import get_backend_extras
+
+        for extra in get_backend_extras(backend_name):
+            if extra not in extras:
+                extras.append(extra)
+
+    for extra in provider_extras or []:
+        if extra not in extras:
+            extras.append(extra)
+
+    return extras
 
 
 def assemble_external_eval_job(
@@ -140,6 +213,9 @@ def assemble_external_eval_job(
         "BEAKER_SKIP_DOCKER_SOCKET": "1",
         "BEAKER_WORKSPACE": workspace,
     }
+    # Add infrastructure config for olmo-eval
+    env_vars.update(BEAKER_INFRA_ENV_VARS)
+
     if beaker_username:
         env_vars["BEAKER_AUTHOR"] = beaker_username
 
@@ -177,13 +253,39 @@ def assemble_external_eval_job(
 
         env_vars.update(get_store_env_defaults())
 
-    extras = ["sandbox"]
-    if store:
-        extras.append("postgres")
-    provider_extras = get_provider_extras(model, default_kind="vllm_server")
-    for extra in provider_extras:
-        if extra not in extras:
-            extras.append(extra)
+    # Collect backend names from external evals
+    # Check eval_args for backend override, otherwise use eval's default
+    from olmo_eval.evals.external.registry import get_external_eval
+
+    backend_names: list[str] = []
+
+    # Check if backend is specified in eval_args (overrides eval default)
+    args_backend = eval_args.get("backend") if eval_args else None
+    if args_backend:
+        backend_names.append(args_backend)
+    else:
+        # Fall back to each eval's default backend
+        for eval_name in external_evals:
+            eval_instance = get_external_eval(eval_name)
+            if eval_instance.backend and eval_instance.backend not in backend_names:
+                backend_names.append(eval_instance.backend)
+
+    # External evals always run vLLM as a server subprocess, so use separate venv
+    # to avoid dependency conflicts with other packages (e.g., openhands)
+    vllm_separate_venv = True
+
+    # Collect extras from all backends
+    extras: list[str] = collect_install_extras(
+        store=store,
+        sandbox=True,
+        provider_extras=get_provider_extras(model, default_kind="vllm_server"),
+    )
+    for backend_name in backend_names:
+        for extra in collect_install_extras(backend_name=backend_name):
+            if extra not in extras:
+                extras.append(extra)
+
+    provider_packages = get_provider_dependencies(model) or None
 
     return BeakerJobConfig(
         name=name,
@@ -207,6 +309,8 @@ def assemble_external_eval_job(
         setup_registry_mirror=setup_registry_mirror,
         setup_store_secrets=store,
         extras=extras,
+        provider_packages=provider_packages,
+        vllm_separate_venv=vllm_separate_venv,
     )
 
 
@@ -245,25 +349,26 @@ class JobConfigAssembler:
 
         command = self._build_command(exp)
 
-        install_extras: list[str] = []
-        if self.config.store:
-            install_extras.append("postgres")
-
+        # Determine backend and sandbox requirements from harness preset
+        backend_name: str | None = None
+        sandbox_enabled = False
         if self.config.harness:
-            from olmo_eval.harness import get_backend_extras, get_harness_preset
+            from olmo_eval.harness import get_harness_preset
 
             preset = get_harness_preset(self.config.harness)
-            if preset.backend:
-                backend_extras = get_backend_extras(preset.backend)
-                install_extras.extend(backend_extras)
-            # Install sandbox extra for any sandbox mode (local, docker, or modal)
-            if preset.sandboxes:
-                install_extras.append("sandbox")
+            backend_name = preset.backend
+            sandbox_enabled = bool(preset.sandboxes)
 
-        # Get provider extras from model preset (takes precedence over harness default)
-        for extra in get_provider_extras(exp.model_spec):
-            if extra not in install_extras:
-                install_extras.append(extra)
+        # Determine provider kind and whether to use separate venv for vLLM
+        provider_kind = get_provider_kind(exp.model_spec)
+        vllm_separate_venv = provider_kind == "vllm_server"
+
+        install_extras = collect_install_extras(
+            store=self.config.store,
+            sandbox=sandbox_enabled,
+            backend_name=backend_name,
+            provider_extras=get_provider_extras(exp.model_spec),
+        )
 
         # Collect env vars that have explicit overrides
         overridden_env_vars = set(self.secret_env_overrides.values())
@@ -294,6 +399,8 @@ class JobConfigAssembler:
             "BEAKER_AUTHOR": self.beaker_username,
             "BEAKER_WORKSPACE": self.config.workspace,
         }
+        # Add infrastructure config for olmo-eval
+        job_env_vars.update(BEAKER_INFRA_ENV_VARS)
 
         if cluster_has_weka(self.config.cluster):
             job_env_vars.update(
@@ -326,7 +433,9 @@ class JobConfigAssembler:
             job_env_vars["MIRROR_HOSTS"] = mirror_url
             setup_registry_mirror = True
 
-        task_packages = self._extract_task_dependencies(exp.tasks, exp.task_overrides)
+        # Collect task dependencies and provider dependencies separately
+        task_packages = self._extract_task_dependencies(exp.tasks, exp.task_overrides) or None
+        provider_packages = get_provider_dependencies(exp.model_spec) or None
 
         return BeakerJobConfig(
             name=exp.name,
@@ -347,10 +456,12 @@ class JobConfigAssembler:
             inject_gcs_credentials=self.inject_gcs_credentials,
             env_vars=job_env_vars,
             env_secrets=env_secrets,
+            provider_packages=provider_packages,
             task_packages=task_packages,
             enable_sandbox=self.enable_sandbox,
             setup_registry_mirror=setup_registry_mirror,
             setup_store_secrets=self.config.store,
+            vllm_separate_venv=vllm_separate_venv,
         )
 
     def _extract_task_dependencies(

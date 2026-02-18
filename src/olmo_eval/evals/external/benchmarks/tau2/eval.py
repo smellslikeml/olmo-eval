@@ -1,11 +1,4 @@
-"""Tau2-bench external evaluation.
-
-tau2_bench is a benchmark for evaluating language model agents on realistic
-customer service tasks. It measures both task completion and constraint
-satisfaction.
-
-Repository: https://github.com/sierra-research/tau2-bench
-"""
+"""Tau2-bench external evaluation implementation."""
 
 from __future__ import annotations
 
@@ -20,12 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from olmo_eval.evals.external.base import ExternalEval
-from olmo_eval.evals.external.registry import register_external_eval
+from olmo_eval.evals.external.base import SandboxedExternalEval
 from olmo_eval.evals.external.result import ExternalEvalResult
 
 if TYPE_CHECKING:
     from olmo_eval.harness.sandbox.executor import SandboxExecutor
+    from olmo_eval.inference.base import InferenceProvider
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +102,7 @@ class Tau2Args:
         )
 
 
-class Tau2ExternalEval(ExternalEval):
+class Tau2ExternalEval(SandboxedExternalEval):
     """Tau2-bench evaluation for customer service agent tasks."""
 
     @property
@@ -125,7 +118,8 @@ class Tau2ExternalEval(ExternalEval):
 
     @property
     def sandbox_image(self) -> str:
-        return "ghcr.io/astral-sh/uv:python3.11-bookworm-slim"
+        # TODO(undfined): Create a custom image with some core utilities (e.g. git, curl, etc)
+        return "ghcr.io/astral-sh/uv:python3.11-bookworm"
 
     @property
     def working_dir(self) -> str:
@@ -142,15 +136,6 @@ class Tau2ExternalEval(ExternalEval):
             f"git clone --depth 1 https://github.com/sierra-research/tau2-bench.git {repo}",
             f"cd {repo} && uv sync",
             f"mkdir -p {self.results_dir}",
-        )
-
-    @property
-    def run_command(self) -> str:
-        return self._build_run_command(
-            model_name="{model}",
-            provider_url="{provider_url}",
-            provider_kind="vllm_server",
-            tau2_args=Tau2Args(),
         )
 
     @property
@@ -180,17 +165,19 @@ class Tau2ExternalEval(ExternalEval):
 
     async def execute(
         self,
-        provider_url: str,
-        model_name: str,
+        provider: InferenceProvider,
         args: dict[str, Any],
         output_dir: str | None = None,
         container_runtime: str = "podman",
-        provider_kind: str | None = None,
     ) -> ExternalEvalResult:
         start_time = time.time()
         tau2_args = Tau2Args.from_dict(args)
         all_output: list[str] = []
-        is_local = provider_kind == "vllm_server"
+
+        # Extract URL and model name from provider for sandbox use
+        provider_url = getattr(provider, "base_url", "http://localhost:8000/v1")
+        model_name = provider.model_name
+        is_local = hasattr(provider, "_server") or "localhost" in provider_url
 
         try:
             from olmo_eval.harness.sandbox.executor import SandboxExecutor
@@ -221,7 +208,7 @@ class Tau2ExternalEval(ExternalEval):
                         executor, model_name, sandbox_url, max_model_len
                     )
 
-                run_cmd = self._build_run_command(model_name, sandbox_url, provider_kind, tau2_args)
+                run_cmd = self._build_run_command(model_name, sandbox_url, is_local, tau2_args)
                 logger.info(f"[{self.name}] Running: {run_cmd}")
 
                 run_result = await executor.execute_command(
@@ -252,11 +239,10 @@ class Tau2ExternalEval(ExternalEval):
         self,
         model_name: str,
         provider_url: str,
-        provider_kind: str | None,
+        is_local: bool,
         tau2_args: Tau2Args,
     ) -> str:
         """Build the tau2 run command."""
-        is_local = provider_kind == "vllm_server"
         agent_model = f"hosted_vllm/{model_name}" if is_local else model_name
         repo = f"{self.working_dir}/tau2-bench"
 
@@ -500,6 +486,3 @@ sys.exit(main())
                 }
             )
         return predictions
-
-
-register_external_eval(Tau2ExternalEval())

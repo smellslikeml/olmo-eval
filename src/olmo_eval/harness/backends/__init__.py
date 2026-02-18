@@ -26,10 +26,25 @@ class Backend:
     Class Attributes:
         name: Human-readable name for this backend.
         required_extras: Tuple of pyproject.toml extra names required by this backend.
+
+    Instance Attributes:
+        _sandbox_manager: Optional sandbox manager for backends that need sandbox access.
     """
 
     name: str = "base"
     required_extras: tuple[str, ...] = ()
+    _sandbox_manager: Any = None
+
+    def set_sandbox_manager(self, sandbox_manager: Any) -> None:
+        """Set an external sandbox manager for this backend.
+
+        Use this to inject a pre-configured sandbox manager instead of
+        letting the backend create its own during initialize().
+
+        Args:
+            sandbox_manager: SandboxManager instance to use.
+        """
+        self._sandbox_manager = sandbox_manager
 
     async def initialize(self, config: HarnessConfig) -> None:
         """Initialize backend resources like sandbox managers.
@@ -50,6 +65,7 @@ class Backend:
         request: LMRequest,
         sampling_params: SamplingParams | None = None,
         trace_metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> HarnessResult:
         """Execute the request and return the result.
 
@@ -59,6 +75,7 @@ class Backend:
             request: The initial request to process.
             sampling_params: Optional sampling parameters override.
             trace_metadata: Optional metadata for tracing (e.g., instance_id, task_id).
+            **kwargs: Backend-specific keyword arguments (e.g., enable_compaction).
 
         Returns:
             HarnessResult with trajectory and final output.
@@ -172,24 +189,34 @@ def validate_backend(name: str) -> None:
         available = ", ".join(sorted(BACKEND_REGISTRY.keys()))
         raise ValueError(f"Unknown backend: '{name}'. Available: {available}")
 
-    # Check required extras by attempting to import key modules
-    if name == "openai_agents":
+    # Maps backend name -> (import_module, display_name, extra_name)
+    backend_checks = {
+        "openai_agents": ("agents", "OpenAI Agents SDK", "agents"),
+        "openhands": ("openhands", "OpenHands SDK", "openhands"),
+    }
+
+    if name in backend_checks:
+        module, display_name, extra = backend_checks[name]
         try:
-            import agents  # type: ignore[import-not-found]  # noqa: F401
+            import importlib
+
+            importlib.import_module(module)
         except ImportError as e:
             raise ImportError(
-                f"Backend '{name}' requires the OpenAI Agents SDK. "
-                f"Install with: pip install openai-agents. Error: {e}"
+                f"Backend '{name}' requires {display_name}. "
+                f"Install with: uv pip install -e '.[{extra}]'"
             ) from e
 
 
 # Import backends to trigger registration
 from .openai_agents import OpenAIAgentsBackend  # noqa: E402
+from .openhands import OpenHandsBackend  # noqa: E402
 
 __all__ = [
     "Backend",
     "BACKEND_REGISTRY",
     "OpenAIAgentsBackend",
+    "OpenHandsBackend",
     "get_backend",
     "get_backend_extras",
     "list_backends",
