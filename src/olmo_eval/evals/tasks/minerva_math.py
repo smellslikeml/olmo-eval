@@ -1,13 +1,13 @@
 from collections.abc import Iterator
 from typing import Any
 
-from olmo_eval.core.formatters import CompletionFormatter, PPLFormatter
-from olmo_eval.core.metrics import AccuracyMetric, BPBMetric, PassAtKMetric
-from olmo_eval.core.scorers import MinervaMathScorer
-from olmo_eval.core.types import Instance, LMOutput, LMRequest, SamplingParams
+from olmo_eval.common.formatters import CompletionFormatter, PPLFormatter
+from olmo_eval.common.metrics import AccuracyMetric, BPBMetric, PassAtKMetric
+from olmo_eval.common.scorers import MinervaMathScorer
+from olmo_eval.common.types import Instance, LMOutput, LMRequest, SamplingParams
 from olmo_eval.data import DataLoader, DataSource
 from olmo_eval.evals.extract import MathExtractor
-from olmo_eval.evals.tasks.core import Task, TaskConfig, register, register_variant
+from olmo_eval.evals.tasks.common import Task, TaskConfig, register, register_variant
 
 MATH_SUBSETS = [
     "algebra",
@@ -43,6 +43,15 @@ MINERVA_MATH_FIXED_FEWSHOT = [
 
 class MinervaMathTask(Task):
     fewshot_split: str = "train"
+    formatter = CompletionFormatter(
+        template="Problem:\n{question}\n\nSolution: ",
+        fewshot_answer_key="solution_text",
+    )
+    metrics = (AccuracyMetric(scorer=MinervaMathScorer),)
+    num_fewshot = 4
+    sampling_params = SamplingParams(
+        max_tokens=1024, temperature=0, stop_sequences=("Problem:", "\n\n")
+    )
 
     def _build_fewshot(self) -> list[Instance]:
         """Use fixed 4 examples when fewshot_source is 'minerva_math_fixed' (matches oe-eval Minerva:MATH:fixed)."""
@@ -144,41 +153,6 @@ class Math500Task(MinervaMathTask):
         )
 
 
-def _minerva_math_config(subset: str) -> TaskConfig:
-    return TaskConfig(
-        name=f"minerva_math_{subset}" if subset else "minerva_math",
-        data_source=DataSource(
-            path="EleutherAI/hendrycks_math",
-            subset=subset,
-        ),
-        formatter=CompletionFormatter(
-            template="Problem:\n{question}\n\nSolution: ",  # space after colon matches oe-eval doc_to_target " " + solution
-            fewshot_answer_key="solution_text",
-        ),
-        metrics=(AccuracyMetric(scorer=MinervaMathScorer),),
-        num_fewshot=4,
-        sampling_params=SamplingParams(
-            max_tokens=1024, temperature=0, stop_sequences=["Problem:", "\n\n"]
-        ),
-    )
-
-
-def _math500_config() -> TaskConfig:
-    return TaskConfig(
-        name="math500",
-        data_source=DataSource(path="HuggingFaceH4/MATH-500"),
-        formatter=CompletionFormatter(
-            template="Problem:\n{question}\n\nSolution: ",  # space after colon matches oe-eval
-            fewshot_answer_key="solution_text",
-        ),
-        metrics=(AccuracyMetric(scorer=MinervaMathScorer),),
-        num_fewshot=4,
-        sampling_params=SamplingParams(
-            max_tokens=1024, temperature=0, stop_sequences=["Problem:", "\n\n"]
-        ),
-    )
-
-
 # Metrics for olmes_n4_v2 variant (4 samples, pass@1,2,4; matches oe-eval minerva_math::olmes:n4:v2)
 _minerva_pass_at_1 = PassAtKMetric(k=1, scorer=MinervaMathScorer)
 _minerva_olmes_n4_v2_metrics = (
@@ -192,13 +166,18 @@ for subset in MATH_SUBSETS:
     task_name = f"minerva_math_{subset}"
     class_name = f"MinervaMath_{subset.title().replace('_', '')}"
 
-    task_cls = type(class_name, (MinervaMathTask,), {})
-    register(task_name, lambda s=subset: _minerva_math_config(s))(task_cls)
+    task_cls = type(class_name, (MinervaMathTask,), {
+        "data_source": DataSource(
+            path="EleutherAI/hendrycks_math",
+            subset=subset,
+        ),
+    })
+    register(task_name)(task_cls)
 
 
-@register("math500", _math500_config)
+@register("math500")
 class Math500(Math500Task):
-    pass
+    data_source = DataSource(path="HuggingFaceH4/MATH-500")
 
 
 for _subset in MATH_SUBSETS:
@@ -208,7 +187,7 @@ for _subset in MATH_SUBSETS:
         _task_name,
         "olmo3",
         sampling_params=SamplingParams(
-            max_tokens=1024, temperature=0.6, top_p=0.6, stop_sequences=["Problem:", "\n\n"]
+            max_tokens=1024, temperature=0.6, top_p=0.6, stop_sequences=("Problem:", "\n\n")
         ),
     )
 
@@ -224,7 +203,7 @@ for _subset in MATH_SUBSETS:
             max_tokens=1024,
             temperature=0.6,
             top_p=0.6,
-            stop_sequences=["Problem:", "\n\n"],
+            stop_sequences=("Problem:", "\n\n"),
             num_samples=4,
         ),
     )
