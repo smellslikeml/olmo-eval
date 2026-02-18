@@ -147,23 +147,22 @@ class OpenAIAgentsBackend(Backend):
         Returns:
             An Agent instance from the agents SDK.
         """
-        from agents import (  # type: ignore[import-not-found]
+        from agents import (
             Agent,
             OpenAIChatCompletionsModel,
             function_tool,
+            set_tracing_disabled,
         )
 
         from olmo_eval.inference.utils import patch_openai_agents_for_vllm
+
+        # Disable trace export to OpenAI's backend (we don't have OPENAI_API_KEY set)
+        set_tracing_disabled(True)
 
         patch_openai_agents_for_vllm()
 
         # Create model using provider's OpenAI client
         client = provider.get_openai_client()
-
-        # Log client configuration for debugging
-        base_url = getattr(client, "base_url", "unknown")
-        timeout = getattr(client, "timeout", "unknown")
-        logger.info(f"OpenAI client configured: base_url={base_url}, timeout={timeout}")
 
         model = OpenAIChatCompletionsModel(
             openai_client=client,
@@ -217,6 +216,7 @@ class OpenAIAgentsBackend(Backend):
         request: LMRequest,
         sampling_params: SamplingParams | None = None,
         trace_metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> HarnessResult:
         """Execute using OpenAI Agents SDK.
 
@@ -226,16 +226,38 @@ class OpenAIAgentsBackend(Backend):
             request: The initial request.
             sampling_params: Optional sampling parameters.
             trace_metadata: Optional metadata for tracing (e.g., instance_id, task_id).
+            **kwargs: Backend-specific options:
+                - enable_compaction: Enable context compaction (default: True).
 
         Returns:
             HarnessResult with trajectory from SDK execution.
         """
+        enable_compaction = kwargs.get("enable_compaction", True)
         try:
-            from agents import Runner, trace  # type: ignore[import-not-found]
+            from agents import Runner, trace
         except ImportError as e:
             raise ImportError(
                 "OpenAI Agents SDK not installed. Install with: pip install openai-agents"
             ) from e
+
+        # Create compaction session if enabled
+        session = None
+        if enable_compaction:
+            try:
+                from agents import SQLiteSession
+                from agents.memory import (
+                    OpenAIResponsesCompactionSession,
+                )
+
+                session_id = (trace_metadata or {}).get("task_id", "default")
+                # Use an in-memory SQLite session as the underlying storage
+                underlying = SQLiteSession(session_id, db_path=":memory:")
+                session = OpenAIResponsesCompactionSession(
+                    session_id=session_id,
+                    underlying_session=underlying,
+                )
+            except ImportError:
+                logger.warning("Context compaction not available - agents.memory not found")
 
         # Check if we need sandbox execution
         needs_sandbox = config.sandboxes and config.has_sandbox_tools
@@ -275,11 +297,15 @@ class OpenAIAgentsBackend(Backend):
         # Run agent within trace context for observability
         with trace(trace_name, metadata=trace_metadata):
             try:
-                result = await Runner.run(
-                    starting_agent=agent,
-                    input=input_text,
-                    max_turns=max_turns,
-                )
+                run_kwargs: dict[str, Any] = {
+                    "starting_agent": agent,
+                    "input": input_text,
+                    "max_turns": max_turns,
+                }
+                if session is not None:
+                    run_kwargs["session"] = session
+
+                result = await Runner.run(**run_kwargs)
             except Exception as e:
                 # Handle MaxTurnsExceeded - return a result with the error instead of raising
                 if type(e).__name__ == "MaxTurnsExceeded":
@@ -313,10 +339,20 @@ class OpenAIAgentsBackend(Backend):
         """
         turns: list[AgentTurn] = []
 
-        if not hasattr(result, "new_items"):
+        # Get items from new_items (primary source in agents SDK)
+        items = getattr(result, "new_items", None) or []
+        if not items:
+            # Fallback to to_input_list() for full conversation history
+            if hasattr(result, "to_input_list"):
+                try:
+                    input_list = result.to_input_list()
+                    if input_list:
+                        return self._convert_input_list_to_trajectory(input_list)
+                except Exception:
+                    pass
             return AgentTrajectory(turns=tuple(turns))
 
-        for item in result.new_items:
+        for item in items:
             item_class = type(item).__name__
 
             if item_class == "MessageOutputItem":
@@ -328,16 +364,20 @@ class OpenAIAgentsBackend(Backend):
                         for part in raw_content:
                             if hasattr(part, "text"):
                                 content += part.text
-                turns.append(AgentTurn.assistant(content=content))
+                if content:
+                    turns.append(AgentTurn.assistant(content=content))
 
             elif item_class == "ToolCallItem":
                 raw = getattr(item, "raw_item", None)
                 if raw is not None:
+                    call_id = getattr(raw, "call_id", "") or getattr(raw, "id", "") or ""
+                    name = getattr(raw, "name", "") or ""
+                    arguments = getattr(raw, "arguments", "{}") or "{}"
                     raw_dict = raw.model_dump() if hasattr(raw, "model_dump") else {}
                     tool_call = ToolCall.create(
-                        call_id=raw.call_id,
-                        name=raw.name,
-                        arguments=raw.arguments or "{}",
+                        call_id=call_id,
+                        name=name,
+                        arguments=arguments,
                         metadata=raw_dict,
                     )
                     turns.append(AgentTurn.assistant(content="", tool_calls=[tool_call]))
@@ -345,14 +385,87 @@ class OpenAIAgentsBackend(Backend):
             elif item_class == "ToolCallOutputItem":
                 output = getattr(item, "output", None)
                 raw = getattr(item, "raw_item", None)
-                raw_dict = dict(raw) if isinstance(raw, dict) else {}
-                tool_call_id = raw_dict.get("call_id", "")
+                # Extract tool_call_id from raw_item
+                tool_call_id = ""
+                if raw is not None:
+                    tool_call_id = getattr(raw, "call_id", "") or getattr(raw, "id", "") or ""
                 content = str(output) if output is not None else ""
                 tool_result = ToolResult(
                     tool_call_id=tool_call_id,
                     content=content,
-                    metadata=raw_dict,
                 )
                 turns.append(AgentTurn.tool([tool_result]))
+
+        return AgentTrajectory(turns=tuple(turns))
+
+    def _convert_input_list_to_trajectory(self, input_list: list[Any]) -> AgentTrajectory:
+        """Convert input list (from to_input_list()) to AgentTrajectory.
+
+        This is a fallback for when new_items is empty but we have the full
+        conversation history available via to_input_list().
+
+        Args:
+            input_list: List of input items from result.to_input_list().
+
+        Returns:
+            AgentTrajectory with converted turns.
+        """
+        turns: list[AgentTurn] = []
+
+        for item in input_list:
+            # Items can be dicts or objects
+            if isinstance(item, dict):
+                role = item.get("role", "")
+                content = item.get("content", "")
+                tool_calls = item.get("tool_calls", [])
+
+                if role == "assistant":
+                    if tool_calls:
+                        converted_calls = []
+                        for tc in tool_calls:
+                            if isinstance(tc, dict):
+                                call_id = tc.get("id", "")
+                                func = tc.get("function", {})
+                                is_dict = isinstance(func, dict)
+                                name = func.get("name", "") if is_dict else ""
+                                args = func.get("arguments", "{}") if is_dict else "{}"
+                            else:
+                                call_id = getattr(tc, "id", "")
+                                func = getattr(tc, "function", None)
+                                name = getattr(func, "name", "") if func else ""
+                                args = getattr(func, "arguments", "{}") if func else "{}"
+                            converted_calls.append(
+                                ToolCall.create(call_id=call_id, name=name, arguments=args)
+                            )
+                        turns.append(
+                            AgentTurn.assistant(content=content, tool_calls=converted_calls)
+                        )
+                    elif content:
+                        turns.append(AgentTurn.assistant(content=content))
+
+                elif role == "tool":
+                    tool_call_id = item.get("tool_call_id", "")
+                    tool_result = ToolResult(tool_call_id=tool_call_id, content=content)
+                    turns.append(AgentTurn.tool([tool_result]))
+
+                elif role == "user":
+                    turns.append(AgentTurn.user(content=content))
+            else:
+                # Handle object-based items
+                item_type = type(item).__name__
+                role = getattr(item, "role", None) or getattr(item, "type", "")
+
+                is_assistant = item_type in ("ResponseOutputMessage", "MessageOutputItem")
+                if is_assistant or role == "assistant":
+                    content = ""
+                    raw_content = getattr(item, "content", None)
+                    if isinstance(raw_content, str):
+                        content = raw_content
+                    elif raw_content:
+                        for part in raw_content:
+                            if hasattr(part, "text"):
+                                content += part.text
+                    if content:
+                        turns.append(AgentTurn.assistant(content=content))
 
         return AgentTrajectory(turns=tuple(turns))

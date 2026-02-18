@@ -84,6 +84,7 @@ class SandboxExecutor:
         self._deployment: Any = None
         self._runtime: Any = None
         self._session_created: bool = False
+        self._session_lock: asyncio.Lock = asyncio.Lock()
 
     def _log(self, level: int, msg: str) -> None:
         """Log a message with optional name prefix."""
@@ -220,12 +221,18 @@ class SandboxExecutor:
                 for key, value in self.config.environment:
                     docker_args.extend(["-e", f"{key}={value}"])
 
-                return DockerDeployment(
-                    image=self.config.image,
-                    container_runtime=self.config.container_runtime,
-                    startup_timeout=self.config.startup_timeout,
-                    docker_args=docker_args or None,
-                )
+                # Build kwargs, omitting None values (swerex doesn't accept None for some fields)
+                deployment_kwargs: dict[str, Any] = {
+                    "image": self.config.image,
+                    "container_runtime": self.config.container_runtime,
+                    "startup_timeout": self.config.startup_timeout,
+                }
+                if docker_args:
+                    deployment_kwargs["docker_args"] = docker_args
+                if self.config.exec_shell:
+                    deployment_kwargs["exec_shell"] = list(self.config.exec_shell)
+
+                return DockerDeployment(**deployment_kwargs)
 
             case SandboxMode.LOCAL:
                 try:
@@ -587,10 +594,16 @@ class SandboxExecutor:
         """Create the session if it doesn't exist."""
         if self._session_created:
             return
-        from swerex.runtime.abstract import CreateBashSessionRequest
 
-        await self._runtime.create_session(CreateBashSessionRequest(session="default"))
-        self._session_created = True
+        async with self._session_lock:
+            # Double-check after acquiring lock
+            if self._session_created:
+                return
+
+            from swerex.runtime.abstract import CreateBashSessionRequest
+
+            await self._runtime.create_session(CreateBashSessionRequest(session="default"))
+            self._session_created = True
 
     async def execute_in_session(
         self,

@@ -216,12 +216,19 @@ def external_evals(filter: str) -> None:
         details.add_column("Field", style="dim", width=16)
         details.add_column("Value", overflow="fold")
 
+        from olmo_eval.evals.external import SandboxedExternalEval
+
         # Description
         details.add_row("Description", eval_instance.description)
 
-        # Sandbox
-        details.add_row("Image", f"[blue]{eval_instance.sandbox_image}[/blue]")
-        details.add_row("Working Dir", eval_instance.working_dir)
+        # Backend (if specified)
+        if eval_instance.backend:
+            details.add_row("Backend", f"[magenta]{eval_instance.backend}[/magenta]")
+
+        # Sandbox info (only for sandboxed evals)
+        if isinstance(eval_instance, SandboxedExternalEval):
+            details.add_row("Image", f"[blue]{eval_instance.sandbox_image}[/blue]")
+            details.add_row("Working Dir", eval_instance.working_dir)
 
         # Timeout
         timeout = eval_instance.timeout_seconds
@@ -245,17 +252,19 @@ def external_evals(filter: str) -> None:
             secrets_str = ", ".join(eval_instance.required_secrets)
             details.add_row("Required Secrets", f"[red]{secrets_str}[/red]")
 
-        # Setup commands - number each command
-        setup_lines = "\n".join(
-            f"[dim]{i}.[/dim] {cmd}" for i, cmd in enumerate(eval_instance.setup_command, 1)
-        )
-        details.add_row("Setup", setup_lines)
+        # Setup commands - only for sandboxed evals
+        if isinstance(eval_instance, SandboxedExternalEval):
+            setup_lines = "\n".join(
+                f"[dim]{i}.[/dim] {cmd}" for i, cmd in enumerate(eval_instance.setup_command, 1)
+            )
+            details.add_row("Setup", setup_lines)
 
-        # Run command - format with line breaks for readability
+        # Run command - only show if non-empty (sandboxed evals with explicit command)
         run_cmd = eval_instance.run_command
-        # Break long commands at argument boundaries
-        run_cmd = run_cmd.replace(" --", " \\\n    --")
-        details.add_row("Run", run_cmd)
+        if run_cmd:
+            # Break long commands at argument boundaries for readability
+            run_cmd = run_cmd.replace(" --", " \\\n    --")
+            details.add_row("Run", run_cmd)
 
         console.print(
             Panel(

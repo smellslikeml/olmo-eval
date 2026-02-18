@@ -51,6 +51,9 @@ agents = [
     "openai-agents~=0.7.0",
     "httpx~=0.28.1",
 ]
+openhands = [
+    "openhands-ai~=1.4.0",
+]
 sandbox = [
     "swe-rex[modal] @ git+https://github.com/jdahm/SWE-ReX.git@johannd/ai2",
 ]
@@ -79,6 +82,17 @@ olmo-eval = "olmo_eval.cli:main"
 
 [tool.uv]
 package = true
+# These extras have incompatible transitive dependencies and cannot be installed together
+conflicts = [
+    [
+        { extra = "agents" },
+        { extra = "openhands" },
+    ],
+    [
+        { extra = "vllm" },
+        { extra = "openhands" },
+    ],
+]
 
 [dependency-groups]
 dev = [
@@ -103,6 +117,18 @@ include = ["src/olmo_eval/harness/sandbox/**"]
 [tool.ty.overrides.rules]
 unresolved-import = "ignore"
 
+# ty overrides for backends module (uses optional openhands/agents dependencies)
+[[tool.ty.overrides]]
+include = ["src/olmo_eval/harness/backends/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
+# ty overrides for adapters module (uses optional openhands/swe-rex dependencies)
+[[tool.ty.overrides]]
+include = ["src/olmo_eval/harness/adapters/**"]
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
@@ -121,6 +147,8 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 # Long strings in test fixtures
 "tests/**/fixtures.py" = ["E501"]
+# Long URLs in model configs
+"src/olmo_eval/common/constants/models.py" = ["E501"]
 
 [tool.ruff.format]
 docstring-code-format = true

@@ -14,21 +14,14 @@ from typing import TYPE_CHECKING, Any, cast
 from olmo_eval.evals.external.result import ExternalEvalResult
 
 if TYPE_CHECKING:
+    from olmo_eval.inference.base import InferenceProvider
     from olmo_eval.inference.providers.config import ProviderConfig
 
 logger = logging.getLogger(__name__)
 
 
 class ExternalEval(ABC):
-    """Abstract base class for external evaluations.
-
-    External evaluations are black-box benchmarks that run in sandbox
-    containers and communicate with a model via an OpenAI-compatible API.
-
-    Each evaluation implements its own execution logic, argument handling,
-    and result extraction. There are no assumptions about setup commands,
-    run commands, or result formats - those are implementation details.
-    """
+    """Abstract base class for external evaluations."""
 
     @property
     @abstractmethod
@@ -44,37 +37,14 @@ class ExternalEval(ABC):
 
     @property
     @abstractmethod
-    def sandbox_image(self) -> str:
-        """Docker image to use for the sandbox container."""
-        ...
-
-    @property
-    @abstractmethod
-    def working_dir(self) -> str:
-        """Working directory inside the sandbox container."""
-        ...
-
-    @property
-    @abstractmethod
     def timeout_seconds(self) -> float:
         """Maximum execution time in seconds."""
-        ...
-
-    @property
-    @abstractmethod
-    def setup_command(self) -> tuple[str, ...]:
-        """Command run to set up the evaluation environment."""
         ...
 
     @property
     def run_command(self) -> str:
         """Command template for display. Override to show the run command structure."""
         return ""
-
-    @property
-    def results_dir(self) -> str:
-        """Directory where evaluation results are saved."""
-        return f"{self.working_dir}/results"
 
     @property
     def required_secrets(self) -> tuple[str, ...]:
@@ -90,26 +60,26 @@ class ExternalEval(ABC):
         """
         return {}
 
+    @property
+    def backend(self) -> str | None:
+        """Backend name used by this evaluation, if any."""
+        return None
+
     @abstractmethod
     async def execute(
         self,
-        provider_url: str,
-        model_name: str,
+        provider: InferenceProvider,
         args: dict[str, Any],
         output_dir: str | None = None,
         container_runtime: str = "podman",
-        provider_kind: str | None = None,
     ) -> ExternalEvalResult:
         """Execute the external evaluation.
 
         Args:
-            provider_url: URL of the inference provider.
-            model_name: Name/identifier of the model being evaluated.
+            provider: Inference provider for LLM calls.
             args: Evaluation-specific arguments (e.g., domain, num_trials).
             output_dir: Optional directory to write results.
             container_runtime: Container runtime to use (docker or podman).
-            provider_kind: Type of provider (e.g., "vllm_server", "litellm").
-                Used to determine if local server setup is needed.
 
         Returns:
             Result of the evaluation.
@@ -118,29 +88,42 @@ class ExternalEval(ABC):
 
     async def execute_with_provider(
         self,
-        provider_config: ProviderConfig,
-        args: dict[str, Any],
+        provider: InferenceProvider | None = None,
+        provider_config: ProviderConfig | None = None,
+        args: dict[str, Any] | None = None,
         output_dir: str | None = None,
         container_runtime: str = "podman",
     ) -> ExternalEvalResult:
-        """Execute the evaluation using a provider configuration."""
-        # Pass the original URL - sandbox will discover gateway dynamically
-        base_url = provider_config.base_url or "http://localhost:8000"
+        """Execute the evaluation using a provider or provider configuration.
+
+        Args:
+            provider: Inference provider instance (preferred).
+            provider_config: Provider configuration to create a provider from.
+            args: Evaluation-specific arguments.
+            output_dir: Optional directory to write results.
+            container_runtime: Container runtime to use.
+
+        Returns:
+            Result of the evaluation.
+        """
+        if provider is None:
+            if provider_config is None:
+                raise ValueError("Either provider or provider_config must be provided")
+            provider = provider_config.create_provider()
 
         return await self.execute(
-            provider_url=base_url,
-            model_name=provider_config.model,
-            args=args,
+            provider=provider,
+            args=args or {},
             output_dir=output_dir,
             container_runtime=container_runtime,
-            provider_kind=provider_config.kind,
         )
 
-    def _build_env_vars(self) -> dict[str, str]:
+    def _build_env_vars(self, secrets: tuple[str, ...] | None = None) -> dict[str, str]:
         """Build environment variables for the sandbox, validating required secrets."""
+        secrets = secrets or self.required_secrets
         env_vars: dict[str, str] = {}
         missing = []
-        for secret in self.required_secrets:
+        for secret in secrets:
             value = os.environ.get(secret)
             if value:
                 env_vars[secret] = value
@@ -151,28 +134,6 @@ class ExternalEval(ABC):
             raise ValueError(f"Missing required secrets: {', '.join(missing)}")
 
         return env_vars
-
-    async def _run_setup(
-        self, executor: Any, all_output: list[str], start_time: float
-    ) -> ExternalEvalResult | None:
-        """Run setup commands. Returns error result if any fail, None on success."""
-        for cmd in self.setup_command:
-            logger.info(f"[{self.name}] Setup: {cmd}")
-            result = await executor.execute_command(
-                cmd, timeout=self.timeout_seconds, stream=True, log_prefix=self.name
-            )
-            all_output.append(f"$ {cmd}\n{result.output}")
-            logger.info(f"[{self.name}] Exit code: {result.exit_code}")
-
-            if not result.success:
-                return ExternalEvalResult(
-                    name=self.name,
-                    success=False,
-                    error=f"Setup failed: {cmd}",
-                    raw_output="\n".join(all_output),
-                    duration_seconds=time.time() - start_time,
-                )
-        return None
 
     def _get_provider_url_for_sandbox(self, provider_url: str) -> str:
         """Get the provider URL that's accessible from within the sandbox.
@@ -187,7 +148,7 @@ class ExternalEval(ABC):
         """
         from urllib.parse import urlparse, urlunparse
 
-        from olmo_eval.evals.external.network import PASTA_HOST_IP
+        from olmo_eval.common.config import get_infra_config
 
         parsed = urlparse(provider_url)
 
@@ -196,9 +157,10 @@ class ExternalEval(ABC):
             return provider_url
 
         # Reconstruct URL with pasta host IP
-        new_netloc = PASTA_HOST_IP
+        pasta_host_ip = get_infra_config().pasta_host_ip
+        new_netloc = pasta_host_ip
         if parsed.port:
-            new_netloc = f"{PASTA_HOST_IP}:{parsed.port}"
+            new_netloc = f"{pasta_host_ip}:{parsed.port}"
 
         new_url = urlunparse(
             (
@@ -290,14 +252,53 @@ class ExternalEval(ABC):
             duration_seconds=time.time() - start_time,
         )
 
+    def _save_results(self, result: ExternalEvalResult, output_dir: str) -> None:
+        """Save results to the output directory."""
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        results_file = output_path / f"{self.name}_results.json"
+
+        with open(results_file, "w") as f:
+            json.dump(result.to_dict(), f, indent=2)
+
+        logger.info(f"[{self.name}] Results saved to {results_file}")
+
+
+class SandboxedExternalEval(ExternalEval):
+    """External eval that runs in a single sandbox container.
+
+    Subclass this for evals that use one container for the entire evaluation.
+    """
+
+    @property
+    @abstractmethod
+    def sandbox_image(self) -> str:
+        """Docker image to use for the sandbox container."""
+        ...
+
+    @property
+    @abstractmethod
+    def working_dir(self) -> str:
+        """Working directory inside the sandbox container."""
+        ...
+
+    @property
+    @abstractmethod
+    def setup_command(self) -> tuple[str, ...]:
+        """Commands to run during setup."""
+        ...
+
+    @property
+    def results_dir(self) -> str:
+        """Directory where evaluation results are saved."""
+        return f"{self.working_dir}/results"
+
     def _create_sandbox_config(
         self,
         container_runtime: str,
         output_dir: str | None = None,
     ) -> Any:
         """Create sandbox configuration for this evaluation."""
-        import os
-
         from olmo_eval.evals.external.network import get_docker_network_args
         from olmo_eval.harness.sandbox.config import (
             ContainerRuntime,
@@ -322,13 +323,24 @@ class ExternalEval(ABC):
             log_dir=log_dir,
         )
 
-    def _save_results(self, result: ExternalEvalResult, output_dir: str) -> None:
-        """Save results to the output directory."""
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        results_file = output_path / f"{self.name}_results.json"
+    async def _run_setup(
+        self, executor: Any, all_output: list[str], start_time: float
+    ) -> ExternalEvalResult | None:
+        """Run setup commands. Returns error result if any fail, None on success."""
+        for cmd in self.setup_command:
+            logger.info(f"[{self.name}] Setup: {cmd}")
+            result = await executor.execute_command(
+                cmd, timeout=self.timeout_seconds, stream=True, log_prefix=self.name
+            )
+            all_output.append(f"$ {cmd}\n{result.output}")
+            logger.info(f"[{self.name}] Exit code: {result.exit_code}")
 
-        with open(results_file, "w") as f:
-            json.dump(result.to_dict(), f, indent=2)
-
-        logger.info(f"[{self.name}] Results saved to {results_file}")
+            if not result.success:
+                return ExternalEvalResult(
+                    name=self.name,
+                    success=False,
+                    error=f"Setup failed: {cmd}",
+                    raw_output="\n".join(all_output),
+                    duration_seconds=time.time() - start_time,
+                )
+        return None
