@@ -51,6 +51,7 @@ class MinervaMathTask(Task):
     sampling_params = SamplingParams(
         max_tokens=1024, temperature=0, stop_sequences=("Problem:", "\n\n")
     )
+    dependencies = ["lark>=1.0"]    
 
     def _build_fewshot(self) -> list[Instance]:
         """Use fixed 4 examples when fewshot_source is 'minerva_math_fixed' (matches oe-eval Minerva:MATH:fixed)."""
