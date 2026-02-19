@@ -568,8 +568,8 @@ class AstaBenchSQA(Task):
     def format_request(self, instance: Instance) -> LMRequest:
         prompt_text = SQA_GENERATION_PROMPT + instance.question
         return LMRequest(
-            request_type=RequestType.COMPLETION,
-            prompt=prompt_text,
+            request_type=RequestType.CHAT,
+            messages=({"role": "user", "content": prompt_text},),
         )
 
     def extract_answer(self, output: LMOutput) -> Any:
