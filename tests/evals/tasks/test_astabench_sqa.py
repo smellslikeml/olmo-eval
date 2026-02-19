@@ -235,17 +235,16 @@ class TestExtractAnswer:
 
 
 class TestFormatRequest:
-    def test_chat_request(self):
+    def test_completion_request(self):
         task = get_task("astabench_scholarqa")
         instance = Instance(
             question="What is attention?",
             metadata={"case_id": "test", "rubric_config": {}},
         )
         request = task.format_request(instance)
-        assert request.request_type == RequestType.CHAT
-        assert len(request.messages) == 1
-        assert "What is attention?" in request.messages[0]["content"]
-        assert "Generate a report" in request.messages[0]["content"]
+        assert request.request_type == RequestType.COMPLETION
+        assert "What is attention?" in request.prompt
+        assert "Generate a report" in request.prompt
 
 
 # =============================================================================
@@ -591,7 +590,7 @@ class TestMetrics:
     def _make_response(self, scores: dict[str, float]) -> Response:
         return Response(
             instance=Instance(question="Q?", metadata={}),
-            request=LMRequest(request_type=RequestType.CHAT, messages=()),
+            request=LMRequest(request_type=RequestType.COMPLETION, prompt=""),
             outputs=[LMOutput(text="")],
             scores=scores,
         )
