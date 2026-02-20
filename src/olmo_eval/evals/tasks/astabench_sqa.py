@@ -575,7 +575,13 @@ class AstaBenchSQA(Task):
 
     def extract_answer(self, output: LMOutput) -> Any:
         """Parse JSON from model output and store structured response."""
-        parsed = extract_json_from_response(output.text)
+        text = output.text
+        # Strip <think>...</think> blocks (e.g. Qwen3) so that JSON
+        # extraction doesn't grab braces from the reasoning trace.
+        think_end = text.find("</think>")
+        if think_end >= 0:
+            text = text[think_end + len("</think>") :]
+        parsed = extract_json_from_response(text)
         if parsed is not None:
             parsed = normalize_agent_response_dict(parsed)
         output.metadata["parsed_response"] = parsed

@@ -225,6 +225,16 @@ class TestExtractAnswer:
         task.extract_answer(output)
         assert "parsed_response" in output.metadata
 
+    def test_strips_think_block(self, task):
+        text = (
+            '<think>\nI should format as {"key": "val"}\n</think>\n'
+            '{"sections": [{"text": "hello", "citations": []}]}'
+        )
+        output = LMOutput(text=text)
+        result = task.extract_answer(output)
+        assert result is not None
+        assert "sections" in result
+
 
 # =============================================================================
 # format_request
