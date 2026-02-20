@@ -42,12 +42,15 @@ logger = logging.getLogger(__name__)
 ASTA_BENCH_REPO = "allenai/asta-bench"
 ASTA_BENCH_REVISION = "a600dc767f850385f4664772e3ba7a7f8be17d5e"
 
-JUST_HAS_A_TITLE = "Paper content unavailable. The paper's title is: "
+JUST_HAS_A_TITLE = (
+    "Paper content unavailable. The paper's title is: "  # from astabench citation_eval.py
+)
 
 # =============================================================================
-# Prompt Templates
+# Prompt Templates (from astabench evals/sqa/task.py, rubric.py, precision_eval.py, citation_eval.py)
 # =============================================================================
 
+# from astabench evals/sqa/task.py:json_to_sample
 SQA_GENERATION_PROMPT = """Generate a report answering the following research question. Be sure to include inline citations for each claim. Return your result as valid JSON with a single key `sections` which is a list of sections, each having keys `title`, `text`, and `citations`. Each entry in `citations` should have a JSON list of `snippets` extracted from the reference document and an `id`, each of which appears exactly in the text. Each `id` should be an inline citation as it appears in the text (with wrapping parentheses or square brackets if appropriate). Each citation should have a `title` if one is available. Any additional information about the citation should go under `metadata`. Do not create a References section.
 
 Here is an example `section` to help you with formatting:
@@ -85,6 +88,7 @@ Here is an example `section` to help you with formatting:
 
 Question: """
 
+# from astabench rubric.py:_assess_properties_jointly
 INGREDIENT_SYSTEM_PROMPT = """You will be given a question someone asked (in <question></question> tags) and the corresponding response (in <response></response> tags) given to them by an assistant.
         You will then be given an enumerated list of criteria by which to evaluate the response. Each criterion specifies requirements that the answer must satisfy. You will assign a score accordingly (see below).
         You will also be given a list of examples (in <examples></examples> tags, below each criterion) that illustrate the type of details that would satisfy the criterion. We do NOT expect any of the specified details to necessarily appear in the answer. These are strictly to be used as guidance for locating the answers that satisfy the set requirement.
@@ -152,6 +156,7 @@ INGREDIENT_SYSTEM_PROMPT = """You will be given a question someone asked (in <qu
 
         Return your result as a JSON object with a single key `scores` whose value is a list of objects, each having keys `criteria_idx`, `reasoning`, `score` and `evidence` from the text supporting the claim."""
 
+# from astabench precision_eval.py:PrecisionEval
 PRECISION_EVAL_PROMPT = """You are given a query and a corresponding long answer.
 
 Goal: find irrelevant paragraphs in the answer. These are paragraphs that don't directly answer the query and shouldn't be in the answer.
@@ -180,6 +185,7 @@ Question: {query}
 Answer: {answer}
 """
 
+# from astabench citation_eval.py:CitationEval.score_citation_group
 CITATION_GROUP_PROMPT = """You are a claim validator. For each claim made in the following text you will determine if it is supported by the quote from it's corresponding inline citations. As is typically done in academic writing, assume that consecutive sentences can share citations. Make sure to also include claims presented in table format. For references with only the title available (ie no quotes from the reference are included), judge them as `supporting` if the title indicates that the paper is likely relevant to the claim being considered. Return a JSON object with a single key `claims` which is a list of `claim` objects, one for each sentence in the text. Each `claim` object contains the claim itself (`text`), a list of `supporting` inline citations and `non_supporting` inline citations and finally a boolean `is_fully_supported` which indicates if the claim is entirely supported by the quotations in the associated citations. Each inline citation corresponding to that claim should appear in either `supporting` or `non_supporting`, but not both. Each claim made in the text should appear in your output, but you should skip sentences covering high level introductory information.
 
 Text:
@@ -190,7 +196,7 @@ References:
 
 
 # =============================================================================
-# JSON / Response Parsing Helpers
+# JSON / Response Parsing Helpers (from astabench evals/sqa/task.py)
 # =============================================================================
 
 
@@ -232,6 +238,7 @@ def format_report(response_dict: dict[str, Any]) -> str:
     return report.strip()
 
 
+# from astabench citation_eval.py:clean_sentence
 def clean_sentence(sentence: str) -> str:
     """Clean XML tags from model-generated sentences."""
     pattern = r'<Paper [^>]*paperTitle="\W*([ _a-zA-Z0-9,.;]+)\W*"[^>]*/?>\s*</Paper>'
@@ -241,10 +248,11 @@ def clean_sentence(sentence: str) -> str:
 
 
 # =============================================================================
-# Scoring Helpers
+# Scoring Helpers (ported from astabench precision_eval.py, rubric.py, citation_eval.py)
 # =============================================================================
 
 
+# from astabench precision_eval.py:PrecisionEval.score
 def compute_precision_score(
     parsed_json: dict[str, Any], answer: str
 ) -> tuple[float, dict[str, Any]]:
@@ -272,6 +280,7 @@ def compute_precision_score(
     return score, metadata
 
 
+# from astabench rubric.py:_assess_properties_jointly
 def compute_ingredient_score(
     parsed_json: dict[str, Any],
     ingredients: list[dict[str, Any]],
@@ -299,6 +308,7 @@ def compute_ingredient_score(
     return sum(weights.get(k, 0) * score_components.get(k, 0) for k in weights)
 
 
+# from astabench citation_eval.py
 def _clean_citation_id(c: str) -> str:
     """Remove brackets/parens from citation ID for comparison."""
     for char in "[]()":
@@ -306,6 +316,7 @@ def _clean_citation_id(c: str) -> str:
     return c
 
 
+# from astabench citation_eval.py
 def _citation_intersection(supporting: list[str], half_credit_ids: list[str]) -> int:
     """Count supporting citations that are title-only (half credit)."""
     supporting_clean = {_clean_citation_id(str(c)) for c in supporting}
@@ -313,6 +324,7 @@ def _citation_intersection(supporting: list[str], half_credit_ids: list[str]) ->
     return len(supporting_clean.intersection(half_clean))
 
 
+# from astabench citation_eval.py
 def _filter_citation(citation: dict[str, Any], sec_text: str) -> bool:
     """Check if citation snippets are present and usable."""
     sec_text_alpha = re.sub(r"[^a-zA-Z]", "", sec_text).lower()
@@ -329,6 +341,7 @@ def _filter_citation(citation: dict[str, Any], sec_text: str) -> bool:
     )
 
 
+# from astabench citation_eval.py:CitationEval
 def compute_citation_scores_from_groups(
     group_results: list[dict[str, Any]],
 ) -> dict[str, float]:
@@ -361,6 +374,7 @@ def compute_citation_scores_from_groups(
     }
 
 
+# from astabench citation_eval.py:CitationEval.score_citation_group
 def score_citation_group(
     judge_fn: JudgeFn,
     citation_group: str,
@@ -433,7 +447,7 @@ def score_citation_group(
 
 
 # =============================================================================
-# Scorer (placeholder for Metric ABC requirement)
+# Scorer + Metrics
 # =============================================================================
 
 
@@ -450,11 +464,6 @@ class SQAJudgeScorer(Scorer):
 
     def score(self, instance: Instance, output: LMOutput) -> float:
         return (output.metadata or {}).get(self.score_key, 0.0)
-
-
-# =============================================================================
-# Metrics
-# =============================================================================
 
 
 class _SQAMetricBase(Metric, ABC):
@@ -543,24 +552,16 @@ class AstaBenchSQA(Task):
         if not question:
             return None
 
-        # Parse metric_config: it may be a JSON string or already a dict
-        metric_config = doc.get("metric_config", {})
-        if isinstance(metric_config, str):
-            try:
-                metric_config = json.loads(metric_config)
-            except json.JSONDecodeError:
-                metric_config = {}
-
-        # The rubric config is nested under metric_config["config"]
-        rubric_config = metric_config.get("config", metric_config)
+        # The HF dataset stores ingredients as a top-level list of dicts,
+        # each with keys: criterion, examples, name, weight.
+        ingredients = doc.get("ingredients", [])
 
         return Instance(
             question=question,
             metadata={
                 "case_id": doc.get("case_id", f"sqa_{index}"),
                 "annotator": doc.get("annotator", ""),
-                "agreement": doc.get("agreement", False),
-                "rubric_config": rubric_config,
+                "rubric_config": {"ingredients": ingredients},
                 "index": index,
             },
         )
@@ -585,7 +586,12 @@ class AstaBenchSQA(Task):
         responses: Sequence[Response],
         context: Any = None,
     ) -> Sequence[Response]:
-        """Score all responses using LLM-as-judge for 4 metrics."""
+        """Score all responses using LLM-as-judge for 4 metrics.
+
+        Overrides Task.score_responses because SQA needs multiple judge calls
+        per instance producing 4+ scores (doesn't fit single-float Scorer.score).
+        Scoring logic ported from astabench evals/sqa/task.py:SQATask.score.
+        """
         self._extract_answers(responses)
 
         judge_fn = build_openai_judge_fn(
@@ -640,7 +646,7 @@ class AstaBenchSQA(Task):
         answer: str,
         rubric_config: dict[str, Any],
     ) -> float:
-        """Score ingredient recall using joint assessment."""
+        """Score ingredient recall. From astabench rubric.py:_assess_properties_jointly."""
         ingredients = rubric_config.get("ingredients", [])
         has_criterion = [ing for ing in ingredients if ing.get("criterion")]
         if not has_criterion:
@@ -671,7 +677,7 @@ class AstaBenchSQA(Task):
         question: str,
         answer: str,
     ) -> float:
-        """Score answer precision by identifying irrelevant paragraphs."""
+        """Score answer precision. From astabench precision_eval.py:PrecisionEval."""
         prompt = PRECISION_EVAL_PROMPT.format(query=question, answer=answer)
         raw = judge_fn(prompt)
         parsed = extract_json_from_response(raw)
@@ -686,7 +692,7 @@ class AstaBenchSQA(Task):
         judge_fn: JudgeFn,
         parsed_response: dict[str, Any],
     ) -> dict[str, float]:
-        """Score citation precision and recall using all-at-once evaluation."""
+        """Score citation precision and recall. From astabench citation_eval.py:CitationEval."""
         bad_snippet = "Please click on the paper title to read the abstract on Semantic Scholar."
         group_results: list[dict[str, Any]] = []
 

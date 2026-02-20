@@ -153,47 +153,44 @@ class TestProcessDoc:
             "case_id": "test_001",
             "question": "What is the impact of attention mechanisms?",
             "annotator": "expert_1",
-            "agreement": True,
-            "metric_config": {
-                "name": "rubric_corpusqa_generic",
-                "config": {
-                    "question": "What is the impact of attention mechanisms?",
-                    "ingredients": [
-                        {
-                            "name": "attention_types",
-                            "criterion": "Discuss different types of attention",
-                            "weight": 0.5,
-                            "examples": ["self-attention", "cross-attention"],
-                        }
-                    ],
-                },
-            },
+            "ingredients": [
+                {
+                    "name": "attention_types",
+                    "criterion": "Discuss different types of attention",
+                    "weight": 0.5,
+                    "examples": ["self-attention", "cross-attention"],
+                }
+            ],
         }
         instance = task.process_doc(doc, index=0)
         assert instance is not None
         assert instance.question == "What is the impact of attention mechanisms?"
         assert instance.metadata["case_id"] == "test_001"
         assert instance.metadata["annotator"] == "expert_1"
-        assert instance.metadata["agreement"] is True
         assert "ingredients" in instance.metadata["rubric_config"]
+        assert len(instance.metadata["rubric_config"]["ingredients"]) == 1
 
     def test_missing_question_skipped(self, task):
         doc = {"case_id": "empty", "question": ""}
         assert task.process_doc(doc, index=0) is None
 
-    def test_string_metric_config(self, task):
+    def test_empty_ingredients(self, task):
         doc = {
             "question": "Test question?",
-            "metric_config": json.dumps(
-                {
-                    "name": "rubric",
-                    "config": {"question": "Test?", "ingredients": []},
-                }
-            ),
+            "ingredients": [],
         }
         instance = task.process_doc(doc, index=0)
         assert instance is not None
         assert isinstance(instance.metadata["rubric_config"], dict)
+        assert instance.metadata["rubric_config"]["ingredients"] == []
+
+    def test_missing_ingredients(self, task):
+        doc = {
+            "question": "Test question?",
+        }
+        instance = task.process_doc(doc, index=0)
+        assert instance is not None
+        assert instance.metadata["rubric_config"]["ingredients"] == []
 
 
 # =============================================================================
