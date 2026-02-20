@@ -256,6 +256,7 @@ class LiteLLMProvider(InferenceProvider):
             max_completion_tokens=50,
             temperature=0.0,
             logprobs=True,
+            top_logprobs=1,  # NOTE: workaround for some providers that return `logprobs: null`
             **self.api_kwargs,
         )
 
