@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import multiprocessing as mp
 from typing import TYPE_CHECKING
 
 from olmo_eval.common.logging import get_logger
+from olmo_eval.inference.metrics.core.stats import compute_batch_hash
 from olmo_eval.runners.asynq.types import QueueItem, ResultItem
 
 if TYPE_CHECKING:
     from olmo_eval.harness import Harness
 
 logger = get_logger(__name__)
+
+
+def _get_native_ids(items: list[QueueItem]) -> list[str]:
+    """Extract native IDs from queue items for batch hashing."""
+    return [f"{item.task_id}:{item.instance_idx}" for item in items]
 
 
 def _format_cause(cause: BaseException) -> str:
@@ -185,6 +190,10 @@ async def process_batch(
                 )
             )
 
+        # Flush metrics after each batch with stable batch hash
+        batch_hash = compute_batch_hash(_get_native_ids(items))
+        harness.flush_metrics(batch_hash)
+
     except Exception as e:
         # Batch failed - report error for all items
         error_detail = _format_error_detail(e)
@@ -239,8 +248,6 @@ async def process_items(
             batchable_items.append(item)
 
     if batchable_items:
-        from olmo_eval.common.progress import ProgressLogger
-
         batches: dict[tuple[RequestType, SamplingParams | None], list[QueueItem]] = {}
         for item in batchable_items:
             key = (item.request.request_type, item.sampling_params)
@@ -248,29 +255,34 @@ async def process_items(
                 batches[key] = []
             batches[key].append(item)
 
-        progress = ProgressLogger(
-            total=len(batchable_items), desc="Processed", logger=log, color="green"
-        )
         for batch in batches.values():
             await process_batch(batch, harness, result_queue)
-            progress.update(len(batch))
-        progress.close()
 
     if chat_items:
         from olmo_eval.common.progress import ProgressLogger
+        from olmo_eval.inference.dispatch import dispatch_concurrent
 
-        semaphore = asyncio.Semaphore(max_concurrency or len(chat_items))
         progress = ProgressLogger(
             total=len(chat_items), desc="Processed", logger=log, color="green"
         )
 
         async def process(item: QueueItem) -> None:
-            async with semaphore:
-                await process_chat_request(item, harness, result_queue)
-                progress.update(1)
+            await process_chat_request(item, harness, result_queue)
 
-        await asyncio.gather(*[process(item) for item in chat_items])
+        def on_progress(done: int, total: int) -> None:
+            progress.update(1)
+
+        await dispatch_concurrent(
+            chat_items,
+            process,
+            max_in_flight=max_concurrency or len(chat_items),
+            on_progress=on_progress,
+        )
         progress.close()
+
+        # Flush metrics after chat requests with stable batch hash
+        batch_hash = compute_batch_hash(_get_native_ids(chat_items))
+        harness.flush_metrics(batch_hash)
 
 
 __all__ = [

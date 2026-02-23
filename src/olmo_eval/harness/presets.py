@@ -12,6 +12,7 @@ from typing import Any
 from olmo_eval.common.constants import BEAKER_RESULT_DIR, LOCAL_RESULT_DIR
 from olmo_eval.common.types import ProviderKind
 from olmo_eval.harness.sandbox import Capability
+from olmo_eval.inference.metrics import MetricsConfig
 
 from .config import HarnessConfig, ProviderConfig
 from .constants import (
@@ -62,7 +63,17 @@ def lazy(fn: Callable[[str], HarnessConfig]) -> _Lazy:
 class HarnessPresets:
     """Harness presets. Access as HarnessPresets.name or get_harness_preset("name")."""
 
-    default = HarnessConfig(name="default")
+    @lazy
+    def default(name: str) -> HarnessConfig:
+        """Default preset with vllm_server and batched processing."""
+        from olmo_eval.runners.asynq.batching import BatchConfig
+
+        return HarnessConfig(
+            name=name,
+            provider=ProviderConfig(kind=ProviderKind.VLLM_SERVER),
+            metrics=MetricsConfig(),
+            batching=BatchConfig.batched(),
+        )
 
     @lazy
     def dr_tulu(name: str) -> HarnessConfig:
