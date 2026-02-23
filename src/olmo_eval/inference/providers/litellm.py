@@ -256,7 +256,7 @@ class LiteLLMProvider(InferenceProvider):
             max_completion_tokens=50,
             temperature=0.0,
             logprobs=True,
-            top_logprobs=1,  # NOTE: workaround for some providers that return `logprobs: null`
+            top_logprobs=1,  # NOTE: workaround for litellm proxy issue https://github.com/BerriAI/litellm/issues/21932
             **self.api_kwargs,
         )
 
