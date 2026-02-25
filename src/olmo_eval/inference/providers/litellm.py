@@ -51,7 +51,7 @@ class LiteLLMProvider(InferenceProvider):
         Args:
             model_name: Model identifier (e.g., "gpt-4", "claude-3-opus").
             base_url: Optional base URL for OpenAI-compatible endpoints.
-            api_base: Optional API base for litellm.completion (if different from base_url).
+            api_base: Optional API base for litellm.completion.
             max_concurrency: Maximum number of concurrent API requests.
             max_retries: Maximum number of retries for transient errors.
             retry_delay: Base delay in seconds between retries (exponential backoff).
