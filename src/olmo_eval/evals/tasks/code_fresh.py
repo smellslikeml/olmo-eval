@@ -1,4 +1,4 @@
-"""C4 perplexity task implementations."""
+"""Code fresh perplexity task implementations."""
 
 from collections.abc import Iterator
 from typing import Any
