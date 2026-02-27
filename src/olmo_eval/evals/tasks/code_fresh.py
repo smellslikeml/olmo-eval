@@ -156,8 +156,8 @@ register_subtasks(
 )
 
 make_suite(
-    "code_fresh",
-    tuple(f"code_fresh_{language}" for language in LANGUAGES),
+    "code_fresh:bpb",
+    tuple(f"code_fresh_{language}:bpb" for language in LANGUAGES),
     aggregation=AggregationStrategy.AVERAGE,
 )
 
