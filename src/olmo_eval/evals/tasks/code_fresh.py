@@ -76,6 +76,7 @@ class CodeFreshBase(Task):
 # @register("code_fresh")
 class CodeFreshFile(CodeFreshBase):
     """MBPP code generation task."""
+
     data_source = DataSource(path="allenai/dolma_eval_code_perplexity_T3_2025_1M_file")
 
 
