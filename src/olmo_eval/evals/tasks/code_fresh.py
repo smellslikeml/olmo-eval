@@ -148,7 +148,7 @@ register_subtasks(
     CodeFreshFile,
     subtasks=LANGUAGES,
     task_prefix="code_fresh",
-    data_source="allenai/dolma_eval_code_perplexity_T3_2025_1M_file",
+    data_source="allenai/code_fresh_0825_1225",
     subtask_attr="subset",
     class_attrs=SHARED_ATTRS,
     variants=VARIANTS,
