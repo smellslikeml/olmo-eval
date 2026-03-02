@@ -76,8 +76,11 @@ def inference_worker(
         load_format = provider_kwargs.get("load_format")
         extra_loader_config = provider_kwargs.get("model_loader_extra_config")
 
+        from olmo_eval.launch.config import get_model_short_name
+
+        short_name = get_model_short_name(model_name)
         worker_logger.info(f"Initializing provider: {provider_kind}")
-        worker_logger.info(f"  Model: {model_name}")
+        worker_logger.info(f"  Model: {short_name}")
         if tokenizer:
             worker_logger.info(f"  Tokenizer: {tokenizer}")
         if gpu_ids:
@@ -156,10 +159,16 @@ def inference_worker(
             strategy = get_strategy(batch_config)
 
             concurrency_str = max_concurrency or "unlimited"
-            worker_logger.info(
-                f"Inference worker ready (strategy={batch_config.strategy}, "
-                f"chunk_size={batch_config.chunk_size}, max_in_flight={concurrency_str})"
-            )
+            if batch_config.strategy == "streaming":
+                worker_logger.info(
+                    f"Inference worker ready (strategy={batch_config.strategy}, "
+                    f"max_in_flight={concurrency_str})"
+                )
+            else:
+                worker_logger.info(
+                    f"Inference worker ready (strategy={batch_config.strategy}, "
+                    f"chunk_size={batch_config.chunk_size})"
+                )
             asyncio.run(
                 strategy.run(
                     item_queue,
