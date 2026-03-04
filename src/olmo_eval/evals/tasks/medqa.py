@@ -123,11 +123,8 @@ class MedQA(Task):
                 best_idx = 0
                 best_logprob = float("-inf")
                 for i, output in enumerate(response.outputs):
-                    logprob = (
-                        output.metadata.get("total_logprob", float("-inf"))
-                        if output.metadata
-                        else float("-inf")
-                    )
+                    meta = output.metadata or {}
+                    logprob = meta.get("total_logprob", meta.get("sum_logits", float("-inf")))
                     if logprob > best_logprob:
                         best_logprob = logprob
                         best_idx = i
