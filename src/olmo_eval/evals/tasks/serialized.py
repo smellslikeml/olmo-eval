@@ -5,10 +5,10 @@ data already contains both raw Instance fields (for scoring) and fully
 formatted LMRequest fields (for inference).  The serialized JSONL is
 produced by oe-eval-internal's serialize_benchmark.py.
 
-Each JSONL line has the schema defined by oe_eval.serialize_benchmark.SerializedRecord:
-    question, gold_answers, choices, metadata,
-    request_type, prompt, messages, continuations,
-    task_name, doc_id, native_id, label
+Top-level JSONL fields (used for Instance / LMRequest building):
+    doc_id, question, gold_answers, choices, metadata,
+    request_type, prompt, messages, continuations
+
 """
 
 from __future__ import annotations
