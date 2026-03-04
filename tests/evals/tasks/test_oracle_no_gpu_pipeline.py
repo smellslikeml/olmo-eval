@@ -68,10 +68,7 @@ async def test_humaneval_bpb_perfect_vs_corrupted_quality() -> None:
     loaded_instances = list(islice(task.instances, 3))
     assert loaded_instances
 
-    requests = [
-        task.format_request(instance=instance)
-        for instance in loaded_instances
-    ]
+    requests = [task.format_request(instance=instance) for instance in loaded_instances]
 
     for request in requests:
         assert request.request_type == RequestType.LOGLIKELIHOOD
@@ -101,19 +98,13 @@ async def test_humaneval_bpb_perfect_vs_corrupted_quality() -> None:
         perfect_output = LMOutput(
             text=continuation,
             logprobs=perfect_logprobs,
-            metadata={
-                "total_logprob": float(
-                    sum(entry["logprob"] for entry in perfect_logprobs)
-                )
-            },
+            metadata={"total_logprob": float(sum(entry["logprob"] for entry in perfect_logprobs))},
         )
         corrupted_output = LMOutput(
             text=continuation,
             logprobs=corrupted_logprobs,
             metadata={
-                "total_logprob": float(
-                    sum(entry["logprob"] for entry in corrupted_logprobs)
-                )
+                "total_logprob": float(sum(entry["logprob"] for entry in corrupted_logprobs))
             },
         )
 
@@ -147,10 +138,7 @@ async def test_labbench_mc_perfect_vs_corrupted_quality() -> None:
     loaded_instances = list(islice(task.instances, 3))
     assert loaded_instances
 
-    requests = [
-        task.format_request(instance=instance)
-        for instance in loaded_instances
-    ]
+    requests = [task.format_request(instance=instance) for instance in loaded_instances]
 
     for request, instance in zip(requests, loaded_instances, strict=True):
         assert request.request_type == RequestType.LOGLIKELIHOOD
@@ -167,9 +155,7 @@ async def test_labbench_mc_perfect_vs_corrupted_quality() -> None:
         assert request.continuations is not None
         gold_idx = int(instance.metadata["gold_idx"])
 
-        wrong_candidates = [
-            idx for idx in range(len(request.continuations)) if idx != gold_idx
-        ]
+        wrong_candidates = [idx for idx in range(len(request.continuations)) if idx != gold_idx]
         wrong_idx = rng.choice(wrong_candidates)
 
         perfect_outputs: list[LMOutput] = []
@@ -224,10 +210,7 @@ async def test_minerva_end_metric_perfect_vs_corrupted_quality() -> None:
     loaded_instances = list(islice(task.instances, 3))
     assert loaded_instances
 
-    requests = [
-        task.format_request(instance=instance)
-        for instance in loaded_instances
-    ]
+    requests = [task.format_request(instance=instance) for instance in loaded_instances]
 
     for request in requests:
         assert request.request_type == RequestType.COMPLETION
@@ -251,8 +234,7 @@ async def test_minerva_end_metric_perfect_vs_corrupted_quality() -> None:
         # Keep format parseable but force likely-wrong extracted answer.
         wrong_value = str(3141592653589793 + rng.randint(1, 99))
         corrupted_text = (
-            "Final Answer: The final answer is "
-            f"$\\boxed{{{wrong_value}}}$. I hope it is correct."
+            f"Final Answer: The final answer is $\\boxed{{{wrong_value}}}$. I hope it is correct."
         )
 
         perfect_output = LMOutput(text=perfect_text)
