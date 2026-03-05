@@ -39,8 +39,11 @@ class CodeFreshBase(Task):
             source = self.config.get_data_source()
             for idx, doc in enumerate(loader.load(source)):
                 if doc["file_tokens"] > MAX_LENGTH:
-                    # throw away documents that are too long
-                    continue
+                    # raise error for files that are too long... dataset should
+                    # have been pre-processed.
+                    raise RuntimeError(
+                        f"Datasets should have been pre-processed to be < {MAX_LENGTH} already"
+                    )
 
                 self._instances_cache.append(self.process_doc(doc=doc, index=idx))
         yield from self._instances_cache
