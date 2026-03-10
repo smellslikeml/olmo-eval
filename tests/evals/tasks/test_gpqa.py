@@ -17,25 +17,37 @@ _ALL_TASKS = (
     "gpqa_extended",
 )
 
+_SUBJECT_TASKS = (
+    "gpqa_diamond_biology",
+    "gpqa_diamond_chemistry",
+    "gpqa_diamond_physics",
+    "gpqa_main_biology",
+    "gpqa_main_chemistry",
+    "gpqa_main_physics",
+    "gpqa_extended_biology",
+    "gpqa_extended_chemistry",
+    "gpqa_extended_physics",
+)
+
 
 class TestGPQARegistration:
     """Tests for GPQA task registration."""
 
-    @pytest.mark.parametrize("task_name", _ALL_TASKS)
+    @pytest.mark.parametrize("task_name", _ALL_TASKS + _SUBJECT_TASKS)
     def test_task_registered(self, task_name):
         assert task_name in list_tasks()
 
-    @pytest.mark.parametrize("task_name", _ALL_TASKS)
+    @pytest.mark.parametrize("task_name", _ALL_TASKS + _SUBJECT_TASKS)
     def test_get_task(self, task_name):
         task = get_task(task_name)
         assert task.config.name == task_name
 
-    @pytest.mark.parametrize("task_name", _ALL_TASKS)
+    @pytest.mark.parametrize("task_name", _ALL_TASKS + _SUBJECT_TASKS)
     def test_mc_variant(self, task_name):
         task = get_task(f"{task_name}:mc")
         assert task is not None
 
-    @pytest.mark.parametrize("task_name", _ALL_TASKS)
+    @pytest.mark.parametrize("task_name", _ALL_TASKS + _SUBJECT_TASKS)
     def test_bpb_variant(self, task_name):
         task = get_task(f"{task_name}:bpb")
         assert task is not None
@@ -160,7 +172,7 @@ class TestProcessDoc:
         }
         assert task.process_doc(doc, index=0) is None
 
-    def test_text_preprocessing_title_brackets(self, task):
+    def test_text_preprocessing_only_strips_title_marker(self, task):
         doc = {
             "Question": "According to [title] some paper [2023], what is X?",
             "Correct Answer": "Answer [ref]",
@@ -170,9 +182,8 @@ class TestProcessDoc:
         }
         instance = task.process_doc(doc, index=0)
         assert "[title]" not in instance.question
-        assert "[2023]" not in instance.question
-        assert "Answer" in instance.metadata["gold_text"]
-        assert "[ref]" not in instance.metadata["gold_text"]
+        assert "[2023]" in instance.question
+        assert instance.metadata["gold_text"] == "Answer [ref]"
 
     def test_text_preprocessing_double_spaces(self, task):
         doc = {
@@ -184,6 +195,59 @@ class TestProcessDoc:
         }
         instance = task.process_doc(doc, index=0)
         assert "  " not in instance.question
+
+    @pytest.mark.parametrize(
+        ("task_name", "subdomain"),
+        (
+            ("gpqa_diamond_biology", "Molecular Biology"),
+            ("gpqa_diamond_biology", "Genetics"),
+            ("gpqa_diamond_chemistry", "Chemistry (general)"),
+            ("gpqa_diamond_chemistry", "Analytical Chemistry"),
+            ("gpqa_diamond_chemistry", "Organic Chemistry"),
+            ("gpqa_diamond_physics", "Physics (general)"),
+            ("gpqa_diamond_physics", "Quantum Mechanics"),
+            ("gpqa_diamond_physics", "Statistical Mechanics"),
+        ),
+    )
+    def test_subject_task_accepts_mapped_subdomains(self, task_name, subdomain):
+        task = get_task(task_name)
+        doc = {
+            "Question": "Q?",
+            "Correct Answer": "Correct",
+            "Incorrect Answer 1": "Wrong 1",
+            "Incorrect Answer 2": "Wrong 2",
+            "Incorrect Answer 3": "Wrong 3",
+            "Subdomain": subdomain,
+        }
+        instance = task.process_doc(doc, index=0)
+        assert instance is not None
+        assert instance.metadata["subdomain"] == subdomain
+
+    def test_subject_task_rejects_non_matching_subdomain(self):
+        task = get_task("gpqa_diamond_physics")
+        doc = {
+            "Question": "Q?",
+            "Correct Answer": "Correct",
+            "Incorrect Answer 1": "Wrong 1",
+            "Incorrect Answer 2": "Wrong 2",
+            "Incorrect Answer 3": "Wrong 3",
+            "Subdomain": "Molecular Biology",
+        }
+        assert task.process_doc(doc, index=0) is None
+
+    def test_subject_task_warns_for_unmapped_subdomain(self, caplog):
+        task = get_task("gpqa_diamond_physics")
+        doc = {
+            "Question": "Q?",
+            "Correct Answer": "Correct",
+            "Incorrect Answer 1": "Wrong 1",
+            "Incorrect Answer 2": "Wrong 2",
+            "Incorrect Answer 3": "Wrong 3",
+            "Subdomain": "Unknown Subdomain",
+        }
+        with caplog.at_level("WARNING"):
+            assert task.process_doc(doc, index=0) is None
+        assert "unmapped subdomain" in caplog.text
 
 
 class TestExtractAnswer:

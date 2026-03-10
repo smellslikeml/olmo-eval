@@ -60,7 +60,7 @@ _SUBJECT_GROUPS: dict[str, set[str]] = {
     "chemistry": {
         "Organic Chemistry",
         "Chemistry",
-        "General Chemistry",
+        "Chemistry (general)",
         "Analytical Chemistry",
         "Inorganic Chemistry",
         "Physical Chemistry",
@@ -68,6 +68,7 @@ _SUBJECT_GROUPS: dict[str, set[str]] = {
     "physics": {
         "Quantum Mechanics",
         "Physics",
+        "Physics (general)",
         "Astrophysics",
         "High-energy particle physics",
         "Condensed Matter Physics",
@@ -233,13 +234,13 @@ class GPQATask(Task):
         return None
 
 
-_BRACKET_MARKER = re.compile(r"\[.*?\]")
-_MULTI_SPACE = re.compile(r"  +")
+_TITLE_MARKER = re.compile(r"\s*\[title\]\s*", re.IGNORECASE)
+_MULTI_SPACE = re.compile(r" {2,}")
 
 
 def _clean_text(text: str) -> str:
-    """Normalize GPQA text: strip bracketed markers and collapse whitespace."""
-    text = _BRACKET_MARKER.sub("", text)
+    """Normalize GPQA text while preserving bracketed scientific content."""
+    text = _TITLE_MARKER.sub(". ", text)
     text = _MULTI_SPACE.sub(" ", text)
     return text.strip()
 
