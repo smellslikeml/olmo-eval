@@ -63,6 +63,7 @@ class Harmbench(Task):
                 "index": index,
                 "functional_cat": functional_cat,
                 "semantic_cat": semantic_cat,
+                "gold_answer": "no",
             },
         )
 
