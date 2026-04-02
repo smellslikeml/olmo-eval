@@ -168,7 +168,7 @@ class VLLMServerProvider(InferenceProvider):
         self,
         model_name: str,
         base_url: str | None = None,
-        timeout: float = 60.0,
+        timeout: float = 1800.0,
         max_concurrency: int = 32,
         max_retries: int = 3,
         tensor_parallel_size: int = 1,
