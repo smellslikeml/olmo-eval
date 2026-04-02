@@ -25,7 +25,7 @@ _PASS_AT_32_SAMPLING = SamplingParams(
     num_samples=32,
 )
 
-_COT_SUFFIX = "\nPlease reason step by step, and put your final answer within \\boxed{}."
+_COT_SUFFIX = "\nPlease reason step by step, and put your final answer within \\boxed{{}}."
 
 _PASS_AT_32_FORMATTER = ChatFormatter(
     user_template="{question}" + _COT_SUFFIX,
