@@ -90,20 +90,9 @@ class AIME2025Task(AIMETask):
 
 
 for _year in ("2024", "2025"):
-    _task = f"aime_{_year}"
-
     register_variant(
-        _task,
-        "pass_at_32_rlzero",
-        formatter=_PASS_AT_32_R1_FORMATTER,
-        metrics=_PASS_AT_32_METRICS,
-        primary_metric=PassAtKMetric(k=1, scorer=MinervaMathScorer),
-        sampling_params=_PASS_AT_32_SAMPLING,
-    )
-
-    register_variant(
-        _task,
-        "pass_at_32_deepseek",
+        f"aime_{_year}",
+        "pass_at_32",
         formatter=_PASS_AT_32_R1_FORMATTER,
         metrics=_PASS_AT_32_METRICS,
         primary_metric=PassAtKMetric(k=1, scorer=MinervaMathScorer),
