@@ -9,11 +9,6 @@ from olmo_eval.data import DataSource
 from olmo_eval.evals.extract import MathExtractor
 from olmo_eval.evals.tasks.common import Task, register, register_variant
 
-AIME_SYSTEM_PROMPT = (
-    "You are a helpful assistant that solves math competition problems. "
-    "Show your work step-by-step, then put your final integer answer in \\boxed{}."
-)
-
 ZS_COT_R1_SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
 
 
@@ -21,7 +16,6 @@ ZS_COT_R1_SYSTEM_PROMPT = "Please reason step by step, and put your final answer
 class AIMETask(Task):
     data_source = DataSource(path="allenai/aime-2021-2025")
     formatter = ChatFormatter(
-        system_prompt=AIME_SYSTEM_PROMPT,
         user_template="{question}",
     )
     metrics = (AccuracyMetric(scorer=MinervaMathScorer),)
@@ -72,23 +66,6 @@ class AIMETask(Task):
         return answers[0] if answers else None
 
 
-# --- Variant: zs_cot_r1 (zero-shot chain-of-thought, R1-style) ---
-# Base R1-style reasoning variant
-register_variant(
-    "aime",
-    "zs_cot_r1",
-    formatter=ChatFormatter(
-        system_prompt=ZS_COT_R1_SYSTEM_PROMPT,
-        user_template="{question}",
-    ),
-    sampling_params=SamplingParams(
-        max_tokens=16384,
-        temperature=0.6,
-        top_p=0.95,
-    ),
-)
-
-
 # --- Year-filtered task classes ---
 @register("aime_2024")
 class AIME2024Task(AIMETask):
@@ -122,19 +99,6 @@ _PASS_AT_32_R1_FORMATTER = ChatFormatter(
     user_template="{question}",
 )
 
-# aime:zs_cot_r1::pass_at_32_2024_rlzero
-# Accessed as: aime_2024:zs_cot_r1:pass_at_32_rlzero
-register_variant(
-    "aime_2024",
-    "zs_cot_r1",
-    formatter=_PASS_AT_32_R1_FORMATTER,
-    sampling_params=SamplingParams(
-        max_tokens=16384,
-        temperature=0.6,
-        top_p=0.95,
-    ),
-)
-
 register_variant(
     "aime_2024",
     "pass_at_32_rlzero",
@@ -142,19 +106,6 @@ register_variant(
     metrics=_PASS_AT_32_METRICS,
     primary_metric=PassAtKMetric(k=1, scorer=MinervaMathScorer),
     sampling_params=_PASS_AT_32_SAMPLING,
-)
-
-# aime:zs_cot_r1::pass_at_32_2025_rlzero
-# Accessed as: aime_2025:zs_cot_r1:pass_at_32_rlzero
-register_variant(
-    "aime_2025",
-    "zs_cot_r1",
-    formatter=_PASS_AT_32_R1_FORMATTER,
-    sampling_params=SamplingParams(
-        max_tokens=16384,
-        temperature=0.6,
-        top_p=0.95,
-    ),
 )
 
 register_variant(
