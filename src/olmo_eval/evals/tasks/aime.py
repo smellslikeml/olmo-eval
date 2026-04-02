@@ -19,7 +19,7 @@ _PASS_AT_32_METRICS = (
 )
 
 _PASS_AT_32_SAMPLING = SamplingParams(
-    max_tokens=16384,
+    max_tokens=32768,
     temperature=0.6,
     top_p=0.95,
     num_samples=32,
@@ -37,7 +37,7 @@ class AIMETask(MinervaMathTask):
     formatter = ChatFormatter(user_template="{question}")
     metrics = (AccuracyMetric(scorer=MinervaMathScorer),)
     num_fewshot = 0
-    sampling_params = SamplingParams(max_tokens=16384, temperature=0.0)
+    sampling_params = SamplingParams(max_tokens=32768, temperature=0.0)
 
     years: list[int]
 
