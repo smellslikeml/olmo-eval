@@ -76,13 +76,30 @@ class AIME2025Task(AIMETask):
     years = [2025]
 
 
+_RLZERO_FORMATTER = ChatFormatter(user_template="{question}")
+
+_RLZERO_SAMPLING = SamplingParams(
+    max_tokens=32768,
+    temperature=1.0,
+    top_p=0.95,
+    num_samples=32,
+)
+
 for _year in (2024, 2025):
-    for _variant in ("pass_at_32", "pass_at_32_rlzero"):
-        register_variant(
-            f"aime_{_year}",
-            _variant,
-            formatter=_PASS_AT_32_FORMATTER,
-            metrics=_PASS_AT_32_METRICS,
-            primary_metric=_PASS_AT_32_METRICS[1],
-            sampling_params=_PASS_AT_32_SAMPLING,
-        )
+    register_variant(
+        f"aime_{_year}",
+        "pass_at_32",
+        formatter=_PASS_AT_32_FORMATTER,
+        metrics=_PASS_AT_32_METRICS,
+        primary_metric=_PASS_AT_32_METRICS[1],
+        sampling_params=_PASS_AT_32_SAMPLING,
+    )
+
+    register_variant(
+        f"aime_{_year}",
+        "pass_at_32_rlzero",
+        formatter=_RLZERO_FORMATTER,
+        metrics=_PASS_AT_32_METRICS,
+        primary_metric=_PASS_AT_32_METRICS[1],
+        sampling_params=_RLZERO_SAMPLING,
+    )
