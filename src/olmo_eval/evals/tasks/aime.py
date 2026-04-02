@@ -77,11 +77,12 @@ class AIME2025Task(AIMETask):
 
 
 for _year in (2024, 2025):
-    register_variant(
-        f"aime_{_year}",
-        "pass_at_32",
-        formatter=_PASS_AT_32_FORMATTER,
-        metrics=_PASS_AT_32_METRICS,
-        primary_metric=_PASS_AT_32_METRICS[1],
-        sampling_params=_PASS_AT_32_SAMPLING,
-    )
+    for _variant in ("pass_at_32", "pass_at_32_rlzero"):
+        register_variant(
+            f"aime_{_year}",
+            _variant,
+            formatter=_PASS_AT_32_FORMATTER,
+            metrics=_PASS_AT_32_METRICS,
+            primary_metric=_PASS_AT_32_METRICS[1],
+            sampling_params=_PASS_AT_32_SAMPLING,
+        )
