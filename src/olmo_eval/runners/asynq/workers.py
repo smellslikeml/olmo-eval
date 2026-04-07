@@ -219,6 +219,7 @@ def scoring_worker(
     sandbox_configs_list: list[dict[str, Any]] | None = None,
     ready_event: MPEvent | None = None,
     max_concurrency: int = DEFAULT_SCORING_CONCURRENCY,
+    registry_config: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
     """Worker process that scores responses with concurrent execution.
 
@@ -236,6 +237,9 @@ def scoring_worker(
         sandbox_configs_list: Optional list of serialized SandboxConfigs for code execution.
         ready_event: Optional event to signal when worker is ready.
         max_concurrency: Maximum concurrent scoring operations.
+        registry_config: Optional config for ProviderRegistry (auxiliary providers).
+            Format: {name: [config_dict, ...]} where each config_dict is a
+            serialized ProviderConfig with base_url set.
     """
     import sys
 
@@ -250,6 +254,23 @@ def scoring_worker(
 
     sandbox_manager = None
     scoring_context: ScoringContext | None = None
+
+    # Cache Task objects by spec so only the first ScoringItem per spec
+    # needs to carry (and unpickle) the full Task.
+    from olmo_eval.evals.tasks.common import Task
+
+    task_cache: dict[str, Task] = {}
+
+    def get_task(item: ScoringItem) -> Task:
+        if item.task is not None:
+            task_cache[item.spec] = item.task
+        task = task_cache.get(item.spec)
+        if task is None:
+            raise RuntimeError(
+                f"No cached Task for spec {item.spec!r}. "
+                "The first ScoringItem for each spec must include the Task."
+            )
+        return task
 
     async def run_scoring_loop() -> None:
         """Main async scoring loop using continuous dispatch pattern.
@@ -398,10 +419,22 @@ def scoring_worker(
                 )
                 sys.exit(1)
 
-            scoring_context = ScoringContext(
-                execution_env=sandbox_manager,
-                scoring_concurrency=max_concurrency,
-            )
+        # Create provider registry from config (servers already running)
+        provider_registry = None
+        if registry_config:
+            from olmo_eval.inference.registry import ProviderRegistry
+
+            provider_registry = ProviderRegistry.from_serialized(registry_config)
+            if provider_registry:
+                worker_logger.info(
+                    f"Provider registry ready with providers: {provider_registry.names}"
+                )
+
+        scoring_context = ScoringContext(
+            execution_env=sandbox_manager,
+            scoring_concurrency=max_concurrency,
+            inference_pool=provider_registry,
+        )
 
         # Signal that worker is ready
         worker_logger.info("Scorer ready")
