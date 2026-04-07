@@ -139,7 +139,7 @@ class Tau2ExternalEval(SandboxedExternalEval):
             f"git clone --depth 1 https://github.com/pdasigi/tau2-bench-verified.git {repo}",
             # Pin to commit 6a0dbca
             f"cd {repo} && git checkout 6a0dbca",
-            "uv sync",
+            f"cd {repo} && uv sync",
             f"mkdir -p {self.results_dir}",
         )
 
