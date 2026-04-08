@@ -15,8 +15,8 @@ from olmo_eval.inference.tokenizer_utils import encode_context_and_continuation
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from vllm import LLM  # type: ignore[ty:unresolved-import]
-    from vllm.outputs import RequestOutput  # type: ignore[ty:unresolved-import]
+    from vllm import LLM
+    from vllm.outputs import RequestOutput
 
 
 def _configure_vllm_logger(worker_id: str | None) -> None:
@@ -128,7 +128,7 @@ class VLLMProvider(InferenceProvider):
             _configure_vllm_logger(worker_id)
 
         try:
-            from vllm import LLM  # type: ignore[ty:unresolved-import]
+            from vllm import LLM
         except ImportError as e:
             import traceback
 
@@ -191,7 +191,7 @@ class VLLMProvider(InferenceProvider):
 
     def _build_sampling_params(self, params: SamplingParams) -> Any:
         """Convert SamplingParams to vLLM SamplingParams."""
-        from vllm import SamplingParams as VLLMSamplingParams  # type: ignore[ty:unresolved-import]
+        from vllm import SamplingParams as VLLMSamplingParams
 
         # Handle do_sample=False (greedy decoding)
         temperature = 0.0 if not params.do_sample else params.temperature
@@ -277,7 +277,7 @@ class VLLMProvider(InferenceProvider):
         self,
         requests: list[LMRequest],
     ) -> list[list[LMOutput]]:
-        from vllm import SamplingParams as VLLMSamplingParams  # type: ignore[ty:unresolved-import]
+        from vllm import SamplingParams as VLLMSamplingParams
 
         vllm_params = VLLMSamplingParams(
             prompt_logprobs=1,
@@ -353,6 +353,17 @@ class VLLMProvider(InferenceProvider):
                     if not token_probs:
                         continue
 
+                    # Check if this token is the argmax (greedy choice).
+                    # Must check BEFORE the lp_obj gate so we catch non-greedy tokens
+                    # even when they aren't in the top-k returned by prompt_logprobs.
+                    if is_greedy:
+                        max_token_id = max(
+                            token_probs.keys(),
+                            key=lambda tid: _coerce_logprob_to_num(token_probs[tid]),
+                        )
+                        if max_token_id != token_id:
+                            is_greedy = False
+
                     # Look up logprob for the actual continuation token (not first key in dict)
                     lp_obj = token_probs.get(token_id)
                     if lp_obj is None:
@@ -368,15 +379,6 @@ class VLLMProvider(InferenceProvider):
                         }
                     )
                     total += logprob_val
-
-                    # Check if this token is the argmax (greedy choice)
-                    if is_greedy:
-                        max_token_id = max(
-                            token_probs.keys(),
-                            key=lambda tid: _coerce_logprob_to_num(token_probs[tid]),
-                        )
-                        if max_token_id != token_id:
-                            is_greedy = False
 
                 num_tokens = len(logprob_entries)
                 request_outputs.append(

@@ -5,7 +5,8 @@ import sys
 from collections.abc import Iterator
 from typing import Any
 
-from olmo_eval.common.metrics import LogprobPerTokenMCAccuracyMetric
+from olmo_eval.common.formatters import PPLFormatter
+from olmo_eval.common.metrics import BPBMetric, LogprobPerTokenMCAccuracyMetric
 from olmo_eval.common.types import Instance, LMRequest, RequestType, SamplingParams, Split
 from olmo_eval.data import DataSource
 from olmo_eval.evals.tasks.common import Task, register, register_variant
@@ -95,6 +96,9 @@ class _BasicSkillsBase(Task):
         rng = random.Random(self.config.fewshot_seed)
         return rng.sample(all_instances, k)
 
+    def _is_bpb(self) -> bool:
+        return isinstance(self.config.formatter, PPLFormatter)
+
     def format_request(self, instance: Instance) -> LMRequest:
         fewshot_candidates = self.get_fewshot()
 
@@ -110,10 +114,9 @@ class _BasicSkillsBase(Task):
             parts.append(f"{ex.question} {answer}")
 
         parts.append(instance.question)
+        prompt = "\n\n".join(parts)
 
         continuations = tuple(f" {c}" for c in (instance.choices or ()))
-
-        prompt = "\n\n".join(parts)
         return LMRequest(
             request_type=RequestType.LOGLIKELIHOOD,
             prompt=prompt,
@@ -141,9 +144,16 @@ for _subtask in BASIC_SKILLS_SUBTASKS:
     setattr(sys.modules[__name__], _class_name, _cls)
     register(_task_name)(_cls)
     register_variant(_task_name, "rc")
+    register_variant(_task_name, "bpb", formatter=PPLFormatter(), metrics=(BPBMetric(),))
     register_variant(
         _task_name,
         "olmo3base",
+        num_fewshot=5,
+        fewshot_seed=1234,
+    )
+    register_variant(
+        _task_name,
+        "olmes",
         num_fewshot=5,
         fewshot_seed=1234,
     )

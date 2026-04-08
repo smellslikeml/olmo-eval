@@ -4,7 +4,11 @@ from collections.abc import Iterator
 from typing import Any
 
 from olmo_eval.common.formatters import MultipleChoiceFormatter
-from olmo_eval.common.metrics import LogprobMCAccuracyMetric, LogprobPerCharMCAccuracyMetric
+from olmo_eval.common.metrics import (
+    BPBMetric,
+    LogprobMCAccuracyMetric,
+    LogprobPerCharMCAccuracyMetric,
+)
 from olmo_eval.common.types import Instance, LMRequest, RequestType, SamplingParams, Split
 from olmo_eval.data import DataSource
 from olmo_eval.evals.tasks.common import Task, register, register_variant
@@ -162,6 +166,46 @@ register_variant(
 
 register_variant(
     "squad:rc",
+    "olmo3base",
+    limit=10_000,
+    seed=1234,
+    fewshot_source="squad_mc_fixed",
+)
+
+
+@register("squad:bpb")
+class SquadBPB(_SquadMCBase):
+    data_source = DataSource(path="allenai/squad_mc", split="validation")
+    split = Split.VALIDATION
+    metrics = (BPBMetric(),)
+    fewshot_source = "squad_mc_fixed"
+
+    def format_request(self, instance: Instance) -> LMRequest:
+        fewshot = self.get_fewshot()
+
+        parts: list[str] = []
+        for ex in fewshot:
+            answer = ex.gold_answer or ex.metadata.get("gold_text", "")
+            parts.append(_format_rc(ex.question, answer))
+
+        parts.append(_format_rc(instance.question))
+
+        gold_idx = instance.metadata.get("gold_idx", 0)
+        if instance.choices and 0 <= gold_idx < len(instance.choices):
+            gold_text = instance.choices[gold_idx]
+        else:
+            gold_text = instance.gold_answer or ""
+
+        prompt = "\n\n".join(parts)
+        return LMRequest(
+            request_type=RequestType.LOGLIKELIHOOD,
+            prompt=prompt,
+            continuations=(f" {gold_text}",),
+        )
+
+
+register_variant(
+    "squad:bpb",
     "olmo3base",
     limit=10_000,
     seed=1234,

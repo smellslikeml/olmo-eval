@@ -10,6 +10,7 @@ from .base import (
     LogprobMCAccuracyMetric,
     LogprobPerCharMCAccuracyMetric,
     LogprobPerTokenMCAccuracyMetric,
+    LogprobUncondMCAccuracyMetric,
     MeanPerplexityMetric,
     Metric,
     PassAtKMetric,
@@ -19,8 +20,11 @@ from .base import (
     ToolAccuracyMetric,
 )
 
+BPBMetric = BPBMetricInstanceAvg
+
 __all__ = [
     "AccuracyMetric",
+    "BPBMetric",
     "BPBMetricByteAvg",
     "BPBMetricInstanceAvg",
     "CorpusPerplexityMetric",
@@ -29,6 +33,7 @@ __all__ = [
     "LogprobMCAccuracyMetric",
     "LogprobPerCharMCAccuracyMetric",
     "LogprobPerTokenMCAccuracyMetric",
+    "LogprobUncondMCAccuracyMetric",
     "MeanPerplexityMetric",
     "Metric",
     "PassAtKMetric",

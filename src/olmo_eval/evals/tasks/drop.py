@@ -7,8 +7,14 @@ from dataclasses import dataclass
 from itertools import permutations
 from typing import Any
 
-from olmo_eval.common.formatters import MultipleChoiceFormatter
-from olmo_eval.common.metrics import AccuracyMetric, F1Metric, LogprobMCAccuracyMetric
+from olmo_eval.common.formatters import MultipleChoiceFormatter, PPLFormatter
+from olmo_eval.common.metrics import (
+    AccuracyMetric,
+    BPBMetric,
+    F1Metric,
+    LogprobMCAccuracyMetric,
+    LogprobPerCharMCAccuracyMetric,
+)
 from olmo_eval.common.scorers import Scorer
 from olmo_eval.common.types import Instance, LMOutput, LMRequest, RequestType, SamplingParams, Split
 from olmo_eval.data import DataSource
@@ -211,6 +217,13 @@ def _format_drop_mc(
     return prompt
 
 
+def _format_drop_rc(passage: str, question: str, answer: str | None = None) -> str:
+    prompt = f"Passage: {passage}\nQuestion: {question}\nAnswer:"
+    if answer:
+        prompt += f" {answer}"
+    return prompt
+
+
 def _get_answers(doc: dict[str, Any]) -> list[tuple[str, ...]]:
     def _flatten_validated_answers(validated_answers: dict[str, Any]) -> list[dict[str, Any]]:
         valid_answers = []
@@ -408,3 +421,114 @@ register_variant(
     num_fewshot=5,
     fewshot_source="olmes_drop_fixed",
 )
+
+
+@register("drop:rc")
+class DropRC(Drop):
+    data_source = DataSource(path="allenai/drop_mc", split="validation")
+    split = Split.VALIDATION
+    metrics = (LogprobPerCharMCAccuracyMetric(),)
+    primary_metric = LogprobPerCharMCAccuracyMetric()
+    num_fewshot = 5
+    fewshot_source = "olmes_drop_mc_fixed"
+
+    def format_request(self, instance: Instance) -> LMRequest:
+        fewshot = self.get_fewshot()
+
+        parts: list[str] = []
+        for ex in fewshot:
+            answer = ex.gold_answer or ex.metadata.get("gold_text", "")
+            passage = ex.metadata.get("passage", "")
+            parts.append(_format_drop_rc(passage, ex.question, answer))
+
+        passage = instance.metadata.get("passage", "")
+        parts.append(_format_drop_rc(passage, instance.question))
+        continuations = tuple(f" {c}" for c in (instance.choices or ()))
+
+        prompt = "\n\n".join(parts)
+        return LMRequest(
+            request_type=RequestType.LOGLIKELIHOOD,
+            prompt=prompt,
+            continuations=continuations,
+        )
+
+
+register_variant("drop:rc", "olmo3base")
+
+
+@register("drop:bpb")
+class DropBPB(Drop):
+    data_source = DataSource(path="allenai/drop_mc", split="validation")
+    split = Split.VALIDATION
+    formatter = PPLFormatter()
+    metrics = (BPBMetric(),)
+    primary_metric = BPBMetric()
+    num_fewshot = 5
+    fewshot_source = "olmes_drop_mc_fixed"
+
+    def process_doc(self, doc: dict[str, Any], index: int = 0) -> Instance | None:
+        passage = doc["passage_original"].strip()
+        question = doc["question_original"]
+        choices = tuple(doc["choices"]["text"])
+        answer_key = doc["answerKey"]
+        gold_idx = ord(answer_key) - ord("A")
+        gold_text = choices[gold_idx] if 0 <= gold_idx < len(choices) else ""
+
+        formatted_question = f"Passage: {passage}\nQuestion: {question}\nAnswer:"
+
+        return Instance(
+            question=formatted_question,
+            choices=choices,
+            gold_answer=" " + gold_text,
+            metadata={
+                "id": doc.get("id", f"drop_mc_{index}"),
+                "index": index,
+                "gold_idx": gold_idx,
+                "gold_text": gold_text,
+                "passage": passage,
+            },
+        )
+
+    def _build_fewshot(self) -> list[Instance]:
+        if self.config.fewshot_source == "olmes_drop_mc_fixed":
+            return self._build_bpb_fixed_fewshot()
+        return super()._build_fewshot()
+
+    def _build_bpb_fixed_fewshot(self) -> list[Instance]:
+        instances = []
+        for doc in DROP_MC_FIXED_FEWSHOT:
+            passage = str(doc["passage_original"]).strip()
+            question = str(doc["question_original"])
+            choices_data = doc["choices"]
+            assert isinstance(choices_data, dict)
+            choices = tuple(choices_data["text"])
+            answer_key = str(doc["answerKey"])
+            gold_idx = ord(answer_key) - ord("A")
+            gold_text = choices[gold_idx] if 0 <= gold_idx < len(choices) else ""
+
+            formatted_question = f"Passage: {passage}\nQuestion: {question}\nAnswer:"
+
+            instances.append(
+                Instance(
+                    question=formatted_question,
+                    choices=choices,
+                    gold_answer=" " + gold_text,
+                    metadata={
+                        "gold_idx": gold_idx,
+                        "gold_text": gold_text,
+                        "passage": passage,
+                    },
+                )
+            )
+
+        num = self.config.num_fewshot
+        if num and num < len(instances):
+            instances = instances[:num]
+        return instances
+
+    def format_request(self, instance: Instance) -> LMRequest:
+        assert self.config.formatter is not None
+        return self.config.formatter.format(instance, self.get_fewshot())
+
+
+register_variant("drop:bpb", "olmo3base")
