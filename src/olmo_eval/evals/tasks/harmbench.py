@@ -9,15 +9,16 @@ Usage:
 """
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from olmo_eval.common.formatters import ChatFormatter
 from olmo_eval.common.metrics import AccuracyMetric
 from olmo_eval.common.scorers import SafetyScorer
-from olmo_eval.common.types import Instance, LMRequest, RequestType, SamplingParams
+from olmo_eval.common.types import Instance, LMRequest, RequestType, Response, SamplingParams
 from olmo_eval.data import DataLoader, DataSource
 from olmo_eval.evals.tasks.common import Task, register, register_variant
+from olmo_eval.tasks.extract import extract_think_answer
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,13 @@ class Harmbench(Task):
             request_type=RequestType.CHAT,
             messages=({"role": "user", "content": instance.question},),
         )
+
+    def _extract_answers(self, responses: Sequence[Response]) -> None:
+        """Extract the answers from model. Reasoning logic from oe-eval"""
+        print(self.config["name"])
+        for response in responses:
+            for output in response.outputs:
+                output.extracted_answer = extract_think_answer(self.extract_answer(output))
 
 
 # =============================================================================
