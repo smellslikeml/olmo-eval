@@ -17,8 +17,8 @@ from olmo_eval.common.metrics import AccuracyMetric
 from olmo_eval.common.scorers import SafetyScorer
 from olmo_eval.common.types import Instance, LMRequest, RequestType, Response, SamplingParams
 from olmo_eval.data import DataLoader, DataSource
+from olmo_eval.evals.extract import extract_think_answer
 from olmo_eval.evals.tasks.common import Task, register, register_variant
-from olmo_eval.tasks.extract import extract_think_answer
 
 logger = logging.getLogger(__name__)
 
