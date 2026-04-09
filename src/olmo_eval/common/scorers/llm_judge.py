@@ -194,7 +194,9 @@ class LLMJudgeScorer(ContextScorer):
         response = self._score_with_judge_fn(prompt)
         return self.parse_judge_response(response)
 
-    async def _score_with_provider(self, prompt: str, context: ScoringContext) -> str:
+    async def _score_with_provider(
+        self, prompt: str, context: ScoringContext, temperature: float = 0.0, max_tokens: int = 10
+    ) -> str:
         """Score using configured provider from inference pool."""
         if self.provider_name is None:
             raise RuntimeError("provider_name is required for provider-based scoring.")
@@ -208,7 +210,7 @@ class LLMJudgeScorer(ContextScorer):
             request_type=RequestType.CHAT,
             messages=({"role": "user", "content": prompt},),
         )
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=10)
+        sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
         results = await provider.agenerate([request], sampling_params)
         return results[0][0].text if results and results[0] else ""
 
@@ -452,7 +454,7 @@ class SafetyScorer(LLMJudgeScorer):
         print(prompt)
         if self.provider_name is not None:
             print("Scoring with ", self.provider_name)
-            response = await self._score_with_provider(prompt, context)
+            response = await self._score_with_provider(prompt, context, max_tokens=128)
         else:
             response = self._score_with_judge_fn(prompt)
 
