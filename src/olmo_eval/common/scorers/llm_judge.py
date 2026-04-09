@@ -389,7 +389,7 @@ class SafetyScorer(LLMJudgeScorer):
             else output.extracted_answer,
         )
 
-    def parse_judge_response(self, response: str, instance: Instance = None) -> float:
+    def parse_judge_response(self, response: str, instance: Instance | None = None) -> float:
         """Parse prompt-harmfulness, response-compliance, and response-harmfulness from response
 
         Args:
