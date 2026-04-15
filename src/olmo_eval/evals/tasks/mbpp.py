@@ -1,10 +1,8 @@
-"""MBPP code generation task implementations."""
-
 from collections.abc import Iterator
 from typing import Any
 
 from olmo_eval.common.formatters import PPLFormatter
-from olmo_eval.common.metrics import BPBMetric, BPBMetricByteAvg, PassAtKMetric
+from olmo_eval.common.metrics import BPBMetricInstanceAvg, PassAtKMetric
 from olmo_eval.common.scorers import CodeExecutionScorer
 from olmo_eval.common.types import Instance, LMOutput, LMRequest, SamplingParams
 from olmo_eval.data import DataLoader, DataSource
@@ -185,7 +183,7 @@ class MBPPPlus(MBPPPlusBase):
 class MBPPBPB(MBPPBase):
     data_source = DataSource(path="google-research-datasets/mbpp")
     formatter = PPLFormatter(leading_space=False)
-    metrics = (BPBMetric(),)
+    metrics = (BPBMetricInstanceAvg(),)
 
     def process_doc(self, doc: dict[str, Any], index: int = 0) -> Instance:
         question = doc["text"].strip() + "\n```python\n"
@@ -224,14 +222,14 @@ register_variant(
     "mbpp",
     "bpb",
     formatter=PPLFormatter(leading_space=False),
-    metrics=(BPBMetricByteAvg(),),
+    metrics=(BPBMetricInstanceAvg(),),
 )
 
 register_variant(
     "mbpp_plus",
     "bpb",
     formatter=PPLFormatter(leading_space=False),
-    metrics=(BPBMetricByteAvg(),),
+    metrics=(BPBMetricInstanceAvg(),),
 )
 
 # 3shot variant - composable with bpb (e.g., mbpp:3shot:bpb)
