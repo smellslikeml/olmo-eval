@@ -703,7 +703,7 @@ class BeakerLauncher:
         # Install vLLM in isolated venv when requested (for server mode)
         if use_isolated_vllm_venv:
             vllm_venv = "/opt/vllm-venv"
-            steps.append(f"uv venv {vllm_venv}")
+            steps.append(f"uv venv --clear {vllm_venv}")
             # Symlink torch and nvidia packages from main venv (already installed)
             steps.append(
                 f"for pkg in /opt/venv/lib/python*/site-packages/torch* "
