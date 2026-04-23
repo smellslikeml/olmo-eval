@@ -60,7 +60,6 @@ AA's published totals for `gemma-4-31b-it` on SciCode (~1.8M tokens per run):
 uv run olmo-eval beaker launch \
   -E scicode \
   -I finbarrt/olmo-eval-cu1281-trc290-amd64-sandbox-vllm \
-  -K tensor_parallel_size=2 \
   -K 'chat_template_kwargs={"enable_thinking":true}' \
   -A with_background=true \
   -A max_tokens=16384 \
