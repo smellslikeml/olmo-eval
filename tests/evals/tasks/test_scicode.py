@@ -178,7 +178,7 @@ class TestCascade(unittest.IsolatedAsyncioTestCase):
 
             @property
             def names(self) -> list[str]:
-                return ["fake"]
+                return ["cascade"]
 
         task = get_task("scicode:validation")
         real_instance = next(iter(task.instances))

@@ -265,7 +265,6 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
                     scorer_ready,
                     scoring_concurrency,
                     registry_config,
-                    self.output_dir,
                 ),
             )
             scorer_proc.start()

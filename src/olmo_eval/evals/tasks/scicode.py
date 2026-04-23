@@ -615,25 +615,24 @@ class SciCode(Task):
             self._apply_scorers(responses)
         return responses
 
+    provider_name: str = "cascade"
+
     def _resolve_provider_name(self, context: ScoringContext | None) -> str:
-        if getattr(self, "provider_name", None):
-            return str(self.provider_name)
         if context is None or context.inference_pool is None:
             raise RuntimeError(
-                "SciCode sequential cascade requires a ScoringContext with an inference_pool."
+                "SciCode sequential cascade requires a ScoringContext with an "
+                "inference_pool. Configure an auxiliary provider named "
+                f"{self.provider_name!r} (e.g. "
+                f"-o auxiliary_providers.{self.provider_name}.kind=vllm_server "
+                f"-o auxiliary_providers.{self.provider_name}.model=<same model>)."
             )
         names = context.inference_pool.names
-        if "main" in names:
-            return "main"
-        if len(names) != 1:
+        if self.provider_name not in names:
             raise RuntimeError(
-                "SciCode needs exactly one provider in inference_pool; set "
-                "SciCode.provider_name explicitly. Available providers: "
-                f"{names!r}"
+                f"SciCode cascade requires an auxiliary provider named "
+                f"{self.provider_name!r}. Available providers: {names!r}."
             )
-        return names[0]
-
-    provider_name: str | None = None
+        return self.provider_name
 
 
 def _extract_step_code(text: str) -> str:
