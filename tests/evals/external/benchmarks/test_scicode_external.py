@@ -193,6 +193,45 @@ class TestRunProblemCascade(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.passed, 1)
         self.assertNotIn(0, result.step_codes)
 
+    async def test_cascade_embeds_previous_step_code_in_later_prompts(self) -> None:
+        problem = _make_problem(problem_id="99", num_steps=3)
+        responses = [
+            "```python\ndef step_one():\n    return 'ALPHA_MARKER'\n```",
+            "```python\ndef step_two():\n    return 'BETA_MARKER'\n```",
+            "```python\ndef step_three():\n    return 'GAMMA_MARKER'\n```",
+        ]
+        provider = _FakeProvider(responses)
+        sc_args = scicode_eval.SciCodeArgs(max_concurrency=1, with_background=True)
+        evaluator = scicode_eval.SciCodeExternalEval()
+
+        async def fake_verify(**_kwargs: Any) -> list[bool]:
+            return [True, True, True]
+
+        with mock.patch.object(evaluator, "_verify", side_effect=fake_verify):
+            await evaluator._run_problem(
+                problem=problem,
+                provider=provider,
+                sampling_params=SamplingParams(
+                    max_tokens=sc_args.max_tokens, temperature=sc_args.temperature
+                ),
+                sc_args=sc_args,
+                container_runtime="podman",
+            )
+
+        first_prompt = provider.calls[0][0]
+        self.assertNotIn("ALPHA_MARKER", first_prompt)
+        self.assertNotIn("BETA_MARKER", first_prompt)
+
+        second_prompt = provider.calls[1][0]
+        self.assertIn("def step_one()", second_prompt)
+        self.assertIn("ALPHA_MARKER", second_prompt)
+        self.assertNotIn("BETA_MARKER", second_prompt)
+
+        third_prompt = provider.calls[2][0]
+        self.assertIn("ALPHA_MARKER", third_prompt)
+        self.assertIn("BETA_MARKER", third_prompt)
+        self.assertIn("def step_two()", third_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
