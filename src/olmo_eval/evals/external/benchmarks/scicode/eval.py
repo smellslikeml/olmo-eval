@@ -94,12 +94,6 @@ class SciCodeExternalEval(ExternalEval):
         problems = scicode_loader.load_problems(
             split=sc_args.split, problem_ids=sc_args.problem_ids
         )
-        if not problems:
-            return self._error_result(
-                "No SciCode problems loaded",
-                start_time,
-                raw_output=(f"split={sc_args.split}, problem_ids={sc_args.problem_ids}"),
-            )
 
         sampling_params = SamplingParams(
             max_tokens=sc_args.max_tokens, temperature=sc_args.temperature
