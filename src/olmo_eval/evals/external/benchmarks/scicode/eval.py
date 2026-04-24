@@ -362,10 +362,11 @@ def _sandbox_dockerfile_extra() -> tuple[str, ...]:
     """Build Dockerfile steps that install SciCode sandbox deps from uv.lock.
 
     Materializes the checked-in ``pyproject.toml`` and ``uv.lock`` inside the
-    image, then runs ``uv sync`` against the existing ``/root/python`` install
-    that image.py provisions. Embedding the lock contents in the Dockerfile
-    string means any lock-file change invalidates the swerex image cache
-    automatically (the cache key hashes ``dockerfile_extra``).
+    image, exports the lock to a pinned requirements file via ``uv export``,
+    then installs into the existing ``/root/python`` standalone interpreter
+    (which is not a venv, so ``uv sync`` can't target it directly). Embedding
+    the lock contents in the Dockerfile string means any lock change
+    invalidates the swerex image cache automatically.
     """
     return (
         "WORKDIR /opt/scicode",
@@ -373,6 +374,8 @@ def _sandbox_dockerfile_extra() -> tuple[str, ...]:
         f"{_SANDBOX_PYPROJECT}"
         f"SCICODE_PYPROJECT_EOF",
         f"RUN cat > uv.lock <<'SCICODE_UVLOCK_EOF'\n{_SANDBOX_UV_LOCK}SCICODE_UVLOCK_EOF",
-        'ENV UV_PROJECT_ENVIRONMENT="/root/python"',
-        "RUN uv sync --frozen --no-dev --inexact",
+        "RUN uv export --frozen --no-dev --no-hashes --format requirements-txt "
+        "-o /tmp/scicode-requirements.txt",
+        "RUN uv pip install --python /root/python/bin/python --no-cache "
+        "-r /tmp/scicode-requirements.txt",
     )
