@@ -33,8 +33,7 @@ DEFAULT_H5PY_HOST_PATH = "/weka/oe-adapt-default/finbarrt/scicode/test_data.h5"
 DEFAULT_H5PY_CONTAINER_PATH = "/workspace/scicode_test_data.h5"
 
 _SANDBOX_LOCK_DIR = Path(__file__).parent / "sandbox"
-_SANDBOX_PYPROJECT = (_SANDBOX_LOCK_DIR / "pyproject.toml").read_text()
-_SANDBOX_UV_LOCK = (_SANDBOX_LOCK_DIR / "uv.lock").read_text()
+_SANDBOX_DEPS_CONTAINER_DIR = "/opt/scicode-deps"
 
 
 @dataclass
@@ -269,14 +268,30 @@ class SciCodeExternalEval(ExternalEval):
             startup_timeout=sc_args.startup_timeout,
             command_timeout=sc_args.command_timeout,
             inject_swerex=True,
-            dockerfile_extra=_sandbox_dockerfile_extra(),
-            volumes=((sc_args.h5py_host_path, sc_args.h5py_container_path),),
+            volumes=(
+                (sc_args.h5py_host_path, sc_args.h5py_container_path),
+                (
+                    str(_SANDBOX_LOCK_DIR / "pyproject.toml"),
+                    f"{_SANDBOX_DEPS_CONTAINER_DIR}/pyproject.toml",
+                ),
+                (
+                    str(_SANDBOX_LOCK_DIR / "uv.lock"),
+                    f"{_SANDBOX_DEPS_CONTAINER_DIR}/uv.lock",
+                ),
+            ),
         )
         sandbox_manager = SandboxManager([sandbox_config], owner=f"scicode-{problem.problem_id}")
 
         results: list[bool] = []
         try:
             await sandbox_manager.start()
+            sync_result = await sandbox_manager.execute_code(
+                f"uv sync --active --frozen --no-dev --project {_SANDBOX_DEPS_CONTAINER_DIR}",
+                language="bash",
+                timeout=sc_args.startup_timeout,
+            )
+            if not sync_result.success:
+                raise RuntimeError(f"SciCode sandbox dep install failed: {sync_result.output}")
             for idx in scorable_indices:
                 step = problem.sub_steps[idx]
                 script = scicode_verifier.build_step_script(
@@ -293,25 +308,3 @@ class SciCodeExternalEval(ExternalEval):
         finally:
             await sandbox_manager.stop()
         return results
-
-
-def _sandbox_dockerfile_extra() -> tuple[str, ...]:
-    """Build Dockerfile steps that install SciCode sandbox deps from uv.lock.
-
-    Materializes the checked-in ``pyproject.toml`` and ``uv.lock`` inside the
-    image, exports the lock to a pinned requirements file via ``uv export``,
-    then installs into the existing ``/root/python`` standalone interpreter
-    (which is not a venv, so ``uv sync`` can't target it directly). Embedding
-    the lock contents in the Dockerfile string means any lock change
-    invalidates the swerex image cache automatically.
-    """
-    return (
-        "WORKDIR /opt/scicode",
-        f"RUN cat > pyproject.toml <<'SCICODE_PYPROJECT_EOF'\n"
-        f"{_SANDBOX_PYPROJECT}"
-        f"SCICODE_PYPROJECT_EOF",
-        f"RUN cat > uv.lock <<'SCICODE_UVLOCK_EOF'\n{_SANDBOX_UV_LOCK}SCICODE_UVLOCK_EOF",
-        "RUN /root/python/bin/uv export --frozen --no-dev --no-hashes "
-        "--format requirements-txt -o /tmp/scicode-requirements.txt",
-        "RUN /root/python/bin/uv pip install --system --no-cache -r /tmp/scicode-requirements.txt",
-    )

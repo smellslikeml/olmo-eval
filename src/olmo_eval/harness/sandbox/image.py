@@ -17,7 +17,7 @@ PYTHON_STANDALONE_URL = (
 )
 
 # Version bump this when changing the Dockerfile to invalidate cached images
-SWEREX_IMAGE_VERSION = "20260304.1"
+SWEREX_IMAGE_VERSION = "20260424.1"
 
 
 def get_swerex_image(
@@ -122,9 +122,12 @@ RUN apt-get update && \\
     rm -rf /var/lib/apt/lists/*
 ADD {PYTHON_STANDALONE_URL} /tmp/python.tar.gz
 RUN tar xzf /tmp/python.tar.gz -C /root && rm /tmp/python.tar.gz && \\
-    /root/python/bin/pip install --no-cache-dir swe-rex uv
+    /root/python/bin/pip install --no-cache-dir uv && \\
+    /root/python/bin/uv venv /root/venv --python /root/python/bin/python && \\
+    /root/python/bin/uv pip install --python /root/venv/bin/python --no-cache-dir swe-rex uv
 {extra_lines}
-ENV PATH="/root/python/bin:$PATH"
+ENV VIRTUAL_ENV="/root/venv"
+ENV PATH="/root/venv/bin:/root/python/bin:$PATH"
 """
 
     result = subprocess.run(
