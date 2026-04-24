@@ -53,28 +53,6 @@ class SciCodeArgs:
     h5py_container_path: str = DEFAULT_H5PY_CONTAINER_PATH
     sandbox_image: str = "ghcr.io/astral-sh/uv:python3.12-bookworm-slim"
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SciCodeArgs:
-        problem_ids = data.get("problem_ids")
-        if isinstance(problem_ids, str):
-            problem_ids = [p.strip() for p in problem_ids.split(",") if p.strip()]
-        return cls(
-            split=data.get("split", "test"),
-            problem_ids=problem_ids,
-            with_background=bool(data.get("with_background", True)),
-            enable_thinking=bool(data.get("enable_thinking", False)),
-            max_tokens=int(data.get("max_tokens", 16384)),
-            temperature=float(data.get("temperature", 0.6)),
-            max_concurrency=int(data.get("max_concurrency", 4)),
-            command_timeout=float(data.get("command_timeout", 600.0)),
-            startup_timeout=float(data.get("startup_timeout", 300.0)),
-            h5py_host_path=data.get("h5py_host_path", DEFAULT_H5PY_HOST_PATH),
-            h5py_container_path=data.get("h5py_container_path", DEFAULT_H5PY_CONTAINER_PATH),
-            sandbox_image=data.get(
-                "sandbox_image", "ghcr.io/astral-sh/uv:python3.12-bookworm-slim"
-            ),
-        )
-
 
 @dataclass
 class _ProblemResult:
@@ -121,7 +99,10 @@ class SciCodeExternalEval(ExternalEval):
     def arguments(self) -> dict[str, tuple[str, Any | None]]:
         return {
             "split": ("Dataset split (test or validation)", "test"),
-            "problem_ids": ("Comma-separated problem IDs (default: all)", None),
+            "problem_ids": (
+                'JSON list of problem IDs, e.g. \'["13.1","14.2"]\' (default: all)',
+                None,
+            ),
             "with_background": ("Inject scientist-annotated step backgrounds", True),
             "enable_thinking": (
                 "Set chat_template_kwargs.enable_thinking=true on the provider",
@@ -146,7 +127,7 @@ class SciCodeExternalEval(ExternalEval):
         container_runtime: str = "podman",
     ) -> ExternalEvalResult:
         start_time = time.time()
-        sc_args = SciCodeArgs.from_dict(args)
+        sc_args = SciCodeArgs(**args)
 
         if sc_args.enable_thinking:
             provider.chat_template_kwargs = {
