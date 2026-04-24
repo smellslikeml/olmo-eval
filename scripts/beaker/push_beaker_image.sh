@@ -92,7 +92,7 @@ fi
 
 # Check dependencies
 if ! command -v beaker &> /dev/null; then
-    echo "Error: 'beaker' CLI not found. Install with: pip install beaker-py"
+    echo "Error: 'beaker' CLI not found. Install with: uv sync --frozen --extra beaker"
     exit 1
 fi
 

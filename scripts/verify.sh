@@ -24,21 +24,19 @@ done
 
 echo "Running verification checks..."
 
-echo ""
-echo "==> Syncing dependencies..."
-uv sync --dev --extra beaker --extra hf --extra postgres
+UV_RUN="uv run --frozen"
 
 echo ""
 echo "==> Checking formatting with ruff..."
-uv run ruff format --check src/ tests/
+$UV_RUN ruff format --check src/ tests/
 
 echo ""
 echo "==> Running ruff linter..."
-uv run ruff check src/ tests/
+$UV_RUN ruff check src/ tests/
 
 echo ""
 echo "==> Running ty type checker..."
-uv run ty check src/ alembic/
+$UV_RUN ty check src/ alembic/
 
 echo ""
 echo "==> Running tests with coverage..."
@@ -55,7 +53,7 @@ fi
 
 if [ "$NO_DOCKER" = true ]; then
     # Skip docker-based integration tests
-    uv run pytest tests/ $PYTEST_ARGS --no-docker
+    $UV_RUN pytest tests/ $PYTEST_ARGS --no-docker
 else
     # Start docker containers for integration tests
     echo ""
@@ -63,7 +61,7 @@ else
     docker compose -f tests/integration/docker-compose.yml up -d --wait
 
     # Run tests
-    uv run pytest tests/ $PYTEST_ARGS
+    $UV_RUN pytest tests/ $PYTEST_ARGS
     TEST_EXIT_CODE=$?
 
     echo ""

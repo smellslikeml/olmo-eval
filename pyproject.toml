@@ -42,9 +42,11 @@ hf = [
     "transformers~=4.57.3",
 ]
 vllm = [
-    "vllm[runai]==0.13.0",  # runai extras enable S3 model loading
-    "opencv-python-headless==4.13.0.92",  # Required to avoid libxcb import error
-    "torch-c-dlpack-ext",  # Required for TVM tensor allocation in vLLM
+    # vllm + its companions are Linux/CUDA-only; skip on macOS so the lockfile
+    # doesn't resolve GPU wheels for Darwin.
+    "vllm[runai]==0.13.0 ; platform_system != 'Darwin'",  # runai extras enable S3 model loading
+    "opencv-python-headless==4.13.0.92 ; platform_system != 'Darwin'",  # Required to avoid libxcb import error
+    "torch-c-dlpack-ext ; platform_system != 'Darwin'",  # Required for TVM tensor allocation in vLLM
 ]
 litellm = [
     "litellm~=1.80.11",
@@ -73,7 +75,7 @@ postgres = [
     "alembic>=1.18.1",
 ]
 gpu = [
-    "nvidia-ml-py>=12.560",
+    "nvidia-ml-py>=12.560 ; platform_system != 'Darwin'",
 ]
 clients = [
     "openai~=2.21.0",
@@ -87,7 +89,10 @@ olmo-eval = "olmo_eval.cli:main"
 
 [tool.uv]
 package = true
-# These extras have incompatible transitive dependencies and cannot be installed together
+# vllm is installed by default; openhands users must opt out via
+# `uv sync --no-group vllm --group openhands`.
+default-groups = ["dev", "vllm"]
+# These extras/groups have incompatible transitive dependencies and cannot be installed together
 conflicts = [
     [
         { extra = "agents" },
@@ -110,9 +115,14 @@ dev = [
     "ruff>=0.14.0",
     "ty>=0.0.10",
     "pre-commit>=4.0.0",
-    "olmo-eval-internal[storage]",
+    "olmo-eval-internal[storage,beaker,hf]",
     "jinja2>=3.1.6",
     "google-api-core>=2.0.0",
+]
+# Mirror of the `vllm` extra as a uv dependency group so it can be enabled by
+# default for GPU/CI workflows while still being installable via pip extras.
+vllm = [
+    "olmo-eval-internal[vllm]",
 ]
 
 [tool.ruff]
