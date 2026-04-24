@@ -15,18 +15,16 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 from olmo_eval.common.types import LMRequest, RequestType, SamplingParams
 from olmo_eval.evals.external.base import ExternalEval
 from olmo_eval.evals.external.result import ExternalEvalResult
+from olmo_eval.inference.base import InferenceProvider
 
 from . import loader as scicode_loader
 from . import prompts as scicode_prompts
 from . import verifier as scicode_verifier
-
-if TYPE_CHECKING:
-    from olmo_eval.inference.base import InferenceProvider
 
 logger = logging.getLogger(__name__)
 
@@ -218,19 +216,6 @@ class SciCodeExternalEval(ExternalEval):
 
         scorable_indices = [i for i in range(len(sub_steps)) if i not in hardcoded]
         total_scorable = len(scorable_indices)
-
-        if total_scorable == 0:
-            return {
-                "problem_id": problem.problem_id,
-                "problem_name": problem.problem_name,
-                "step_results": [],
-                "step_codes": step_codes,
-                "step_texts": step_texts,
-                "passed": 0,
-                "total": 0,
-                "all_passed": False,
-            }
-
         hardcoded_prelude = "\n\n".join(
             hardcoded[i] for i in sorted(hardcoded) if i < len(sub_steps)
         )
@@ -254,7 +239,7 @@ class SciCodeExternalEval(ExternalEval):
             "step_texts": step_texts,
             "passed": passed,
             "total": total_scorable,
-            "all_passed": passed == total_scorable,
+            "all_passed": total_scorable > 0 and passed == total_scorable,
         }
 
     async def _verify(
@@ -266,19 +251,20 @@ class SciCodeExternalEval(ExternalEval):
         sc_args: SciCodeConfig,
         container_runtime: str,
     ) -> list[bool]:
+        if not scorable_indices:
+            return []
+
         from olmo_eval.harness.sandbox import SandboxManager
         from olmo_eval.harness.sandbox.config import (
             Capability,
-            ContainerRuntime,
             SandboxConfig,
             SandboxMode,
         )
 
-        runtime = cast(ContainerRuntime, container_runtime)
         sandbox_config = SandboxConfig(
             image=sc_args.sandbox_image,
             mode=SandboxMode.DOCKER,
-            container_runtime=runtime,
+            container_runtime=container_runtime,
             capabilities=Capability.PYTHON,
             startup_timeout=sc_args.startup_timeout,
             command_timeout=sc_args.command_timeout,
