@@ -12,8 +12,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from olmo_eval.evals.extract import extract_code as _extract_code_first
-
 _HARDCODED_SNIPPETS: dict[str, dict[int, str]] = {
     "13": {
         5: '''class Maxwell:
@@ -206,24 +204,18 @@ def strip_import_lines(code: str) -> str:
 
 
 _PYTHON_BLOCK_RE = re.compile(r"```python\n(.*?)```", re.DOTALL)
-_GENERIC_BLOCK_RE = re.compile(r"```\n?(.*?)```", re.DOTALL)
 
 
 def extract_step_code(text: str) -> str:
-    """Extract the final python code block from a model response.
+    """Extract the final ```python fenced block from a model response.
 
     Reasoning models interleave scratch code blocks with their final answer, so
-    we take the LAST fenced block, not the first.
+    we take the LAST fenced block, not the first. Returns "" if no fence matches.
     """
-    if not text:
-        return ""
     matches = _PYTHON_BLOCK_RE.findall(text)
     if not matches:
-        matches = _GENERIC_BLOCK_RE.findall(text)
-    code = _extract_code_first(text) if not matches else matches[-1]
-    if not code:
         return ""
-    return strip_import_lines(code)
+    return strip_import_lines(matches[-1])
 
 
 def hardcoded_for_problem(problem_id: str) -> dict[int, str]:

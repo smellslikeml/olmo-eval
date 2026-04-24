@@ -102,7 +102,7 @@ def build_step_script(
     ``full_code`` (the concatenation of all generated sub-step code).
     """
     step_id = step["step_number"]
-    test_cases = list(step.get("test_cases") or ())
+    test_cases = list(step["test_cases"])
     lines: list[str] = [required_dependencies.strip(), _H5_HELPER.strip()]
     if hardcoded_prelude.strip():
         lines.append(hardcoded_prelude.strip())

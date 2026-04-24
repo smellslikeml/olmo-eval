@@ -11,9 +11,9 @@ Dataset: https://huggingface.co/datasets/SciCode1/SciCode
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from olmo_eval.common.types import LMRequest, RequestType, SamplingParams
@@ -27,11 +27,13 @@ from . import verifier as scicode_verifier
 if TYPE_CHECKING:
     from olmo_eval.inference.base import InferenceProvider
 
-logger = logging.getLogger(__name__)
-
 
 DEFAULT_H5PY_HOST_PATH = "/weka/oe-adapt-default/finbarrt/scicode/test_data.h5"
 DEFAULT_H5PY_CONTAINER_PATH = "/workspace/scicode_test_data.h5"
+
+_SANDBOX_LOCK_DIR = Path(__file__).parent / "sandbox"
+_SANDBOX_PYPROJECT = (_SANDBOX_LOCK_DIR / "pyproject.toml").read_text()
+_SANDBOX_UV_LOCK = (_SANDBOX_LOCK_DIR / "uv.lock").read_text()
 
 
 @dataclass
@@ -50,22 +52,17 @@ class SciCodeArgs:
     h5py_host_path: str = DEFAULT_H5PY_HOST_PATH
     h5py_container_path: str = DEFAULT_H5PY_CONTAINER_PATH
     sandbox_image: str = "ghcr.io/astral-sh/uv:python3.12-bookworm-slim"
-    install_command: str = "uv pip install --system --no-cache numpy scipy sympy h5py"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SciCodeArgs:
         problem_ids = data.get("problem_ids")
         if isinstance(problem_ids, str):
             problem_ids = [p.strip() for p in problem_ids.split(",") if p.strip()]
-        elif isinstance(problem_ids, (int, float)):
-            problem_ids = [str(problem_ids)]
-        elif isinstance(problem_ids, list):
-            problem_ids = [str(p) for p in problem_ids]
         return cls(
             split=data.get("split", "test"),
             problem_ids=problem_ids,
-            with_background=_coerce_bool(data.get("with_background", True)),
-            enable_thinking=_coerce_bool(data.get("enable_thinking", False)),
+            with_background=bool(data.get("with_background", True)),
+            enable_thinking=bool(data.get("enable_thinking", False)),
             max_tokens=int(data.get("max_tokens", 16384)),
             temperature=float(data.get("temperature", 0.6)),
             max_concurrency=int(data.get("max_concurrency", 4)),
@@ -76,21 +73,7 @@ class SciCodeArgs:
             sandbox_image=data.get(
                 "sandbox_image", "ghcr.io/astral-sh/uv:python3.12-bookworm-slim"
             ),
-            install_command=data.get(
-                "install_command",
-                "uv pip install --system --no-cache numpy scipy sympy h5py",
-            ),
         )
-
-
-def _coerce_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "y", "on")
-    return bool(value)
 
 
 @dataclass
@@ -101,7 +84,6 @@ class _ProblemResult:
     step_codes: dict[int, str]
     step_texts: dict[int, str]
     total_scorable: int
-    error: str | None = None
 
     @property
     def passed(self) -> int:
@@ -167,8 +149,10 @@ class SciCodeExternalEval(ExternalEval):
         sc_args = SciCodeArgs.from_dict(args)
 
         if sc_args.enable_thinking:
-            existing = getattr(provider, "chat_template_kwargs", None) or {}
-            provider.chat_template_kwargs = {**existing, "enable_thinking": True}
+            provider.chat_template_kwargs = {
+                **(provider.chat_template_kwargs or {}),
+                "enable_thinking": True,
+            }
 
         problems = scicode_loader.load_problems(
             split=sc_args.split, problem_ids=sc_args.problem_ids
@@ -196,26 +180,9 @@ class SciCodeExternalEval(ExternalEval):
                     container_runtime=container_runtime,
                 )
 
-        results = await asyncio.gather(*[run_problem(p) for p in problems], return_exceptions=True)
-
-        problem_results: list[_ProblemResult] = []
-        for i, r in enumerate(results):
-            if isinstance(r, BaseException):
-                problem = problems[i]
-                logger.exception(f"SciCode problem {problem.problem_id} failed with exception: {r}")
-                problem_results.append(
-                    _ProblemResult(
-                        problem_id=problem.problem_id,
-                        problem_name=problem.problem_name,
-                        step_results=[],
-                        step_codes={},
-                        step_texts={},
-                        total_scorable=_count_scorable(problem),
-                        error=str(r),
-                    )
-                )
-            else:
-                problem_results.append(r)
+        problem_results: list[_ProblemResult] = await asyncio.gather(
+            *[run_problem(p) for p in problems]
+        )
 
         total_sub = sum(pr.total_scorable for pr in problem_results)
         passed_sub = sum(pr.passed for pr in problem_results)
@@ -241,7 +208,6 @@ class SciCodeExternalEval(ExternalEval):
                 "step_results": pr.step_results,
                 "step_codes": pr.step_codes,
                 "step_texts": pr.step_texts,
-                "error": pr.error,
             }
             for pr in problem_results
         ]
@@ -298,19 +264,8 @@ class SciCodeExternalEval(ExternalEval):
                 messages=({"role": "user", "content": prompt},),
             )
             results = await provider.agenerate([request], sampling_params)
-            if not results or not results[0]:
-                logger.warning(
-                    f"SciCode {problem.problem_id} step {idx}: provider returned no output"
-                )
-                text = ""
-            else:
-                text = results[0][0].text
+            text = results[0][0].text
             code = scicode_prompts.extract_step_code(text)
-            if text and not code:
-                logger.warning(
-                    f"SciCode {problem.problem_id} step {idx}: extracted empty code "
-                    f"from {len(text)}-char response (first 200: {text[:200]!r})"
-                )
             step_texts[idx] = text
             step_codes[idx] = code
             previous_llm_code[idx] = code
@@ -377,7 +332,7 @@ class SciCodeExternalEval(ExternalEval):
             startup_timeout=sc_args.startup_timeout,
             command_timeout=sc_args.command_timeout,
             inject_swerex=True,
-            dockerfile_extra=(f"RUN {sc_args.install_command}",),
+            dockerfile_extra=_sandbox_dockerfile_extra(),
             volumes=((sc_args.h5py_host_path, sc_args.h5py_container_path),),
         )
         sandbox_manager = SandboxManager([sandbox_config], owner=f"scicode-{problem.problem_id}")
@@ -403,6 +358,21 @@ class SciCodeExternalEval(ExternalEval):
         return results
 
 
-def _count_scorable(problem: scicode_loader.SciCodeProblem) -> int:
-    hardcoded = scicode_prompts.hardcoded_for_problem(problem.problem_id)
-    return sum(1 for i in range(len(problem.sub_steps)) if i not in hardcoded)
+def _sandbox_dockerfile_extra() -> tuple[str, ...]:
+    """Build Dockerfile steps that install SciCode sandbox deps from uv.lock.
+
+    Materializes the checked-in ``pyproject.toml`` and ``uv.lock`` inside the
+    image, then runs ``uv sync`` against the existing ``/root/python`` install
+    that image.py provisions. Embedding the lock contents in the Dockerfile
+    string means any lock-file change invalidates the swerex image cache
+    automatically (the cache key hashes ``dockerfile_extra``).
+    """
+    return (
+        "WORKDIR /opt/scicode",
+        f"RUN cat > pyproject.toml <<'SCICODE_PYPROJECT_EOF'\n"
+        f"{_SANDBOX_PYPROJECT}"
+        f"SCICODE_PYPROJECT_EOF",
+        f"RUN cat > uv.lock <<'SCICODE_UVLOCK_EOF'\n{_SANDBOX_UV_LOCK}SCICODE_UVLOCK_EOF",
+        'ENV UV_PROJECT_ENVIRONMENT="/root/python"',
+        "RUN uv sync --frozen --no-dev --inexact",
+    )

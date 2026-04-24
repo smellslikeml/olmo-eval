@@ -87,13 +87,11 @@ class TestPrompts(unittest.TestCase):
         self.assertIn("def final()", code)
         self.assertNotIn("def scratch()", code)
 
-    def test_extract_step_code_falls_back_to_generic_fence(self) -> None:
-        text = "```\ndef bar():\n    return 2\n```"
-        code = scicode_prompts.extract_step_code(text)
-        self.assertIn("def bar()", code)
-
-    def test_extract_step_code_empty_input(self) -> None:
+    def test_extract_step_code_returns_empty_when_no_python_fence(self) -> None:
         self.assertEqual(scicode_prompts.extract_step_code(""), "")
+        self.assertEqual(
+            scicode_prompts.extract_step_code("```\ndef bar():\n    return 2\n```"), ""
+        )
 
 
 class TestVerifierScript(unittest.TestCase):

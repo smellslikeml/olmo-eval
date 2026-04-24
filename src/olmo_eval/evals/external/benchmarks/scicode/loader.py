@@ -41,8 +41,6 @@ def load_problems(
         if problem_ids and problem_id not in problem_ids:
             continue
         sub_steps = [dict(s) for s in doc["sub_steps"]]
-        if not sub_steps:
-            continue
         problems.append(
             SciCodeProblem(
                 problem_id=problem_id,
