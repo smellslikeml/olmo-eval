@@ -87,45 +87,39 @@ class SciCodeExternalEval(ExternalEval):
         start_time = time.time()
         sc_args = SciCodeConfig(**args)
 
-        original_chat_template_kwargs = provider.chat_template_kwargs
-        if sc_args.enable_thinking:
-            provider.chat_template_kwargs = {
-                **(provider.chat_template_kwargs or {}),
-                "enable_thinking": True,
-            }
+        provider.chat_template_kwargs = (provider.chat_template_kwargs or {}) | {
+            "enable_thinking": sc_args.enable_thinking
+        }
 
-        try:
-            problems = scicode_loader.load_problems(
-                split=sc_args.split, problem_ids=sc_args.problem_ids
+        problems = scicode_loader.load_problems(
+            split=sc_args.split, problem_ids=sc_args.problem_ids
+        )
+        if not problems:
+            return self._error_result(
+                "No SciCode problems loaded",
+                start_time,
+                raw_output=(f"split={sc_args.split}, problem_ids={sc_args.problem_ids}"),
             )
-            if not problems:
-                return self._error_result(
-                    "No SciCode problems loaded",
-                    start_time,
-                    raw_output=(f"split={sc_args.split}, problem_ids={sc_args.problem_ids}"),
+
+        sampling_params = SamplingParams(
+            max_tokens=sc_args.max_tokens, temperature=sc_args.temperature
+        )
+
+        semaphore = asyncio.Semaphore(sc_args.max_concurrency)
+
+        async def run_problem(problem: scicode_loader.SciCodeProblem) -> dict[str, Any]:
+            async with semaphore:
+                return await self._run_problem(
+                    problem=problem,
+                    provider=provider,
+                    sampling_params=sampling_params,
+                    sc_args=sc_args,
+                    container_runtime=container_runtime,
                 )
 
-            sampling_params = SamplingParams(
-                max_tokens=sc_args.max_tokens, temperature=sc_args.temperature
-            )
-
-            semaphore = asyncio.Semaphore(sc_args.max_concurrency)
-
-            async def run_problem(problem: scicode_loader.SciCodeProblem) -> dict[str, Any]:
-                async with semaphore:
-                    return await self._run_problem(
-                        problem=problem,
-                        provider=provider,
-                        sampling_params=sampling_params,
-                        sc_args=sc_args,
-                        container_runtime=container_runtime,
-                    )
-
-            problem_results: list[dict[str, Any]] = await asyncio.gather(
-                *[run_problem(p) for p in problems]
-            )
-        finally:
-            provider.chat_template_kwargs = original_chat_template_kwargs
+        problem_results: list[dict[str, Any]] = await asyncio.gather(
+            *[run_problem(p) for p in problems]
+        )
 
         total_sub = sum(pr["total"] for pr in problem_results)
         passed_sub = sum(pr["passed"] for pr in problem_results)
