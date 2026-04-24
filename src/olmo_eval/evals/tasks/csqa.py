@@ -169,6 +169,16 @@ register_regime(
 )
 register_variant(
     "csqa",
+    "mc_olmo3base",
+    formatter=MultipleChoiceFormatter(),
+    num_fewshot=5,
+    fewshot_source="olmes_csqa_fixed",
+    data_source=DataSource(path="commonsense_qa", split="validation+train"),
+    limit=10000,
+    seed=1234,
+)
+register_variant(
+    "csqa",
     "xlarge",
     data_source=DataSource(path="commonsense_qa", split="validation+train"),
     num_fewshot=5,

@@ -159,6 +159,16 @@ register_regime(
     fewshot_source="olmes_piqa_fixed",
     split=Split.VALIDATION,
 )
+register_variant(
+    "piqa",
+    "mc_olmo3base",
+    formatter=MultipleChoiceFormatter(),
+    num_fewshot=5,
+    fewshot_source="olmes_piqa_fixed",
+    split=Split.ALL,
+    limit=10_000,
+    metrics=(LogprobPerCharMCAccuracyMetric(),),
+)
 
 register_variant(
     "piqa",
