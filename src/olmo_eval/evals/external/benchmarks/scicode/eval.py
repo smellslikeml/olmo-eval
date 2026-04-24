@@ -11,6 +11,7 @@ Dataset: https://huggingface.co/datasets/SciCode1/SciCode
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,8 @@ from . import verifier as scicode_verifier
 
 if TYPE_CHECKING:
     from olmo_eval.inference.base import InferenceProvider
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_H5PY_HOST_PATH = "/weka/oe-adapt-default/finbarrt/scicode/test_data.h5"
@@ -111,9 +114,33 @@ class SciCodeExternalEval(ExternalEval):
                     container_runtime=container_runtime,
                 )
 
-        problem_results: list[dict[str, Any]] = await asyncio.gather(
-            *[run_problem(p) for p in problems]
+        raw_results = await asyncio.gather(
+            *[run_problem(p) for p in problems], return_exceptions=True
         )
+
+        problem_results: list[dict[str, Any]] = []
+        for problem, raw in zip(problems, raw_results, strict=True):
+            if isinstance(raw, BaseException):
+                logger.error(
+                    "SciCode problem %s failed with exception: %s", problem.problem_id, raw
+                )
+                hardcoded = scicode_prompts.HARDCODED_SNIPPETS.get(problem.problem_id, {})
+                total_scorable = sum(1 for i in range(len(problem.sub_steps)) if i not in hardcoded)
+                problem_results.append(
+                    {
+                        "problem_id": problem.problem_id,
+                        "problem_name": problem.problem_name,
+                        "step_results": [],
+                        "step_codes": {},
+                        "step_texts": {},
+                        "passed": 0,
+                        "total": total_scorable,
+                        "all_passed": False,
+                        "error": str(raw),
+                    }
+                )
+            else:
+                problem_results.append(raw)
 
         total_sub = sum(pr["total"] for pr in problem_results)
         passed_sub = sum(pr["passed"] for pr in problem_results)
