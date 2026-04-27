@@ -1,5 +1,6 @@
 """Shared utilities for the CLI."""
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -7,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 import click
 from rich.console import Console
+
+from olmo_eval.common import types
 
 if TYPE_CHECKING:
     from olmo_eval.evals.external.base import ExternalEval
@@ -94,13 +97,14 @@ HARNESS_CONFIG_FIELDS = frozenset(
         "tools",
         "system_prompt",
         "tool_choice",
-        "backend",
+        "scaffold",
         "required_secrets",
         "max_turns",
         "max_concurrency",
         "scoring_concurrency",
         "sandboxes",
-        "backend_kwargs",
+        "scaffold_kwargs",
+        "sandbox_pool_instances",
         "metrics",
         "batching",
         "scorer_startup_timeout",
@@ -170,10 +174,12 @@ def process_ordered_args(
 
             # Apply to task or harness with validation
             if last_flag == "t" and current_task:
-                if top_key not in TASK_CONFIG_FIELDS:
+                sampling_fields = {f.name for f in dataclasses.fields(types.SamplingParams)}
+                if top_key not in TASK_CONFIG_FIELDS and top_key not in sampling_fields:
                     raise click.UsageError(
-                        f"Invalid task override: '{top_key}' is not a TaskConfig field. "
-                        f"Did you mean to put this after --harness instead of -t?"
+                        f"Invalid task override: '{top_key}' is not a TaskConfig or "
+                        f"SamplingParams field. Did you mean to put this after --harness "
+                        f"instead of -t?"
                     )
                 task_overrides[current_task].append(arg.value)
             elif last_flag == "h":
