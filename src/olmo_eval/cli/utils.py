@@ -8,9 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
-from olmo_eval.common.console import console
-
 from olmo_eval.common import types
+from olmo_eval.common.console import console
 
 if TYPE_CHECKING:
     from olmo_eval.evals.external.base import ExternalEval
