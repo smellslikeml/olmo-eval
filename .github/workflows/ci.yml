@@ -43,10 +43,10 @@ jobs:
             uv-${{ runner.os }}-
 
       - name: Run Ruff linter
-        run: uv run --frozen ruff check src/ tests/
+        run: uv run --frozen --no-group vllm ruff check src/ tests/
 
       - name: Run Ruff formatter check
-        run: uv run --frozen ruff format --check src/ tests/
+        run: uv run --frozen --no-group vllm ruff format --check src/ tests/
 
   type-check:
     name: Type Check
@@ -72,7 +72,7 @@ jobs:
             uv-${{ runner.os }}-
 
       - name: Run type checker
-        run: uv run --frozen ty check src/ alembic/
+        run: uv run --frozen --no-group vllm ty check src/ alembic/
 
   # ============================================================================
   # Unit Tests
@@ -106,7 +106,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          uv run --frozen pytest tests/ \
+          uv run --frozen --no-group vllm pytest tests/ \
             --ignore=tests/integration/ \
             -v \
             --cov=src/olmo_eval \
@@ -120,7 +120,7 @@ jobs:
           echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          uv run --frozen coverage report --format=markdown >> $GITHUB_STEP_SUMMARY || uv run --frozen coverage report >> $GITHUB_STEP_SUMMARY
+          uv run --frozen --no-group vllm coverage report --format=markdown >> $GITHUB_STEP_SUMMARY || uv run --frozen --no-group vllm coverage report >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload coverage HTML report
@@ -211,7 +211,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: "test"
           AWS_DEFAULT_REGION: "us-east-1"
         run: |
-          uv run --frozen pytest tests/integration/test_storage.py \
+          uv run --frozen --no-group vllm pytest tests/integration/test_storage.py \
             -v \
             --tb=short
 
@@ -320,7 +320,7 @@ jobs:
       - name: Verify package contents
         run: |
           ls -la dist/
-          uv run --frozen python -m zipfile -l dist/*.whl | head -50
+          uv run --frozen --no-group vllm python -m zipfile -l dist/*.whl | head -50
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
