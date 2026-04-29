@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_H5PY_HOST_PATH = ""
 DEFAULT_H5PY_CONTAINER_PATH = "/workspace/scicode_test_data.h5"
+AI2_H5PY_HOST_PATH = "/weka/oe-adapt-default/finbarrt/scicode/test_data.h5"
 
 _SANDBOX_LOCK_DIR = Path(__file__).parent / "sandbox"
 _SANDBOX_DEPS_CONTAINER_DIR = "/opt/scicode-deps"
@@ -95,6 +97,16 @@ class SciCodeExternalEval(ExternalEval):
     ) -> ExternalEvalResult:
         start_time = time.time()
         sc_args = SciCodeConfig(**args)
+
+        if not sc_args.h5py_host_path:
+            hint = (
+                f" Ai2 internal users: pass -A h5py_host_path={AI2_H5PY_HOST_PATH}."
+                if os.environ.get("BEAKER_TOKEN")
+                else ""
+            )
+            raise ValueError(
+                "SciCode requires h5py_host_path to point to test_data.h5 on the host." + hint
+            )
 
         raw_provider = (
             provider.base_provider if isinstance(provider, InstrumentedProvider) else provider
