@@ -53,14 +53,7 @@ class StreamingStrategy(BatchingStrategy):
             color="green",
         )
         reporter = BeakerStatusReporter()
-
-        def _beaker_message() -> str:
-            elapsed = max(time.time() - progress.start_time, 1e-9)
-            rate = progress.count / elapsed
-            pct = (progress.count / progress.total * 100) if progress.total > 0 else 0.0
-            return (
-                f"Processed {progress.count}/{progress.total} ({pct:.0f}%) at {rate:.2f} items/sec"
-            )
+        beaker_start = time.monotonic()
 
         async def process_single(item: QueueItem) -> None:
             async with semaphore:
@@ -68,7 +61,7 @@ class StreamingStrategy(BatchingStrategy):
                     [item], harness, result_queue, 1, worker_logger, show_progress=False
                 )
                 progress.update(1)
-                reporter.update(_beaker_message())
+                reporter.report_progress("Processed", progress.count, progress.total, beaker_start)
 
         async def get_item() -> QueueItem | None:
             """Get next item from queue asynchronously."""
@@ -100,4 +93,6 @@ class StreamingStrategy(BatchingStrategy):
             await asyncio.gather(*in_flight)
 
         progress.close()
-        reporter.update(_beaker_message(), force=True)
+        reporter.report_progress(
+            "Processed", progress.count, progress.total, beaker_start, force=True
+        )

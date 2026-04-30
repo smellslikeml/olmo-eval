@@ -23,20 +23,17 @@ logger = logging.getLogger(__name__)
 
 _BEAKER_AVAILABLE = importlib.util.find_spec("beaker") is not None
 
+DEFAULT_MIN_INTERVAL = 10.0
+
 
 def _beaker_credentials_present() -> bool:
-    """Return True if Beaker.from_env() will find credentials."""
     if os.environ.get("BEAKER_TOKEN"):
         return True
     config_path = os.environ.get("BEAKER_CONFIG") or os.path.expanduser("~/.beaker/config.yml")
     return os.path.exists(config_path)
 
 
-DEFAULT_MIN_INTERVAL = 10.0
-
-
 def _git_suffix() -> str:
-    """Return ``git_commit: X git_branch: Y`` suffix from env vars (or unknown)."""
     commit = os.environ.get("GIT_COMMIT") or os.environ.get("GIT_REF") or "unknown"
     branch = os.environ.get("GIT_BRANCH") or "unknown"
     return f"git_commit: {commit} git_branch: {branch}"
@@ -46,29 +43,23 @@ class BeakerStatusReporter:
     """Throttled writer for the current Beaker workload's description."""
 
     def __init__(self, min_interval: float = DEFAULT_MIN_INTERVAL) -> None:
-        """Initialize the reporter.
-
-        Args:
-            min_interval: Minimum seconds between non-forced updates.
-        """
         self.min_interval = min_interval
         self._workload_id = os.environ.get("BEAKER_WORKLOAD_ID") or os.environ.get(
             "BEAKER_EXPERIMENT_ID"
         )
-        has_workload = bool(self._workload_id)
         has_creds = _beaker_credentials_present()
-        self.enabled = has_workload and _BEAKER_AVAILABLE and has_creds
-        if has_workload and not _BEAKER_AVAILABLE:
-            logger.warning(
-                "BEAKER_WORKLOAD_ID set but beaker-py not installed; "
-                "Beaker status updates disabled."
+        self.enabled = bool(self._workload_id) and _BEAKER_AVAILABLE and has_creds
+        if self._workload_id and not self.enabled:
+            missing = (
+                "beaker-py"
+                if not _BEAKER_AVAILABLE
+                else "credentials (BEAKER_TOKEN or ~/.beaker/config.yml)"
             )
-        elif has_workload and _BEAKER_AVAILABLE and not has_creds:
             logger.warning(
-                "BEAKER_WORKLOAD_ID set but no Beaker credentials found "
-                "(BEAKER_TOKEN env var or ~/.beaker/config.yml); "
-                "Beaker status updates disabled."
+                "BEAKER_WORKLOAD_ID set but %s missing; Beaker status updates disabled.",
+                missing,
             )
+        self._git_suffix = _git_suffix()
         self._client: Beaker | None = None
         self._workload: BeakerWorkload | None = None
         self._last_update: float = float("-inf")
@@ -90,10 +81,6 @@ class BeakerStatusReporter:
 
         Throttled by ``min_interval`` so callers can call this on every loop
         iteration. No-op when not running inside a Beaker job.
-
-        Args:
-            message: One-line status message.
-            force: If True, bypass the interval throttle.
         """
         if not self.enabled:
             return
@@ -107,8 +94,31 @@ class BeakerStatusReporter:
         if not self._ensure_client():
             return
 
-        full_message = f"{message} {_git_suffix()}"
+        full_message = f"{message} {self._git_suffix}"
         assert self._client is not None and self._workload is not None
         self._client.workload.update(self._workload, description=full_message)
         self._last_update = now
         self._last_message = message
+
+    def report_progress(
+        self,
+        label: str,
+        count: int,
+        total: int,
+        start_time: float,
+        units: str = "items/sec",
+        force: bool = False,
+    ) -> None:
+        """Format and push a standard progress message.
+
+        ``start_time`` must be a ``time.monotonic()`` value.
+        """
+        if not self.enabled:
+            return
+        elapsed = max(time.monotonic() - start_time, 1e-9)
+        rate = count / elapsed
+        pct = (count / total * 100) if total > 0 else 0.0
+        self.update(
+            f"{label} {count}/{total} ({pct:.0f}%) at {rate:.4f} {units}",
+            force=force,
+        )
