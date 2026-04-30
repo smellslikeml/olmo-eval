@@ -59,7 +59,7 @@ class StreamingStrategy(BatchingStrategy):
             rate = progress.count / elapsed
             pct = (progress.count / progress.total * 100) if progress.total > 0 else 0.0
             return (
-                f"Processed {progress.count}/{progress.total} ({pct:.0f}%) at {rate:.1f} items/sec"
+                f"Processed {progress.count}/{progress.total} ({pct:.0f}%) at {rate:.2f} items/sec"
             )
 
         async def process_single(item: QueueItem) -> None:
