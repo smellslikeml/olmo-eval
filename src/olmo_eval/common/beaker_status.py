@@ -101,29 +101,6 @@ class BeakerStatusReporter:
         self._last_update = now
         self._last_message = message
 
-    def report_progress(
-        self,
-        label: str,
-        count: int,
-        total: int,
-        start_time: float,
-        units: str = "items/sec",
-        force: bool = False,
-    ) -> None:
-        """Format and push a standard progress message.
-
-        ``start_time`` must be a ``time.monotonic()`` value.
-        """
-        if not self.enabled:
-            return
-        elapsed = max(time.monotonic() - start_time, 1e-9)
-        rate = count / elapsed
-        pct = (count / total * 100) if total > 0 else 0.0
-        self.update(
-            f"{label} {count}/{total} ({pct:.0f}%) at {rate:.4f} {units}",
-            force=force,
-        )
-
     def progress_callback(self, label: str, units: str = "items/sec") -> Callable[..., None]:
         """Return a ``(count, total, *, force=False)`` callback bound to a fresh start time.
 
@@ -133,8 +110,14 @@ class BeakerStatusReporter:
         start = time.monotonic()
 
         def _cb(count: int, total: int, *, force: bool = False) -> None:
-            self.report_progress(
-                label, count, total, start, units=units, force=force or count == total
+            if not self.enabled:
+                return
+            elapsed = max(time.monotonic() - start, 1e-9)
+            rate = count / elapsed
+            pct = (count / total * 100) if total > 0 else 0.0
+            self.update(
+                f"{label} {count}/{total} ({pct:.0f}%) at {rate:.4f} {units}",
+                force=force or count == total,
             )
 
         return _cb
