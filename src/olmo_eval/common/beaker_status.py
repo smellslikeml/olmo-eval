@@ -34,7 +34,6 @@ class BeakerStatusReporter:
         self._git_suffix = _git_suffix()
         self._workload: BeakerWorkload | None = None
         self._last_update: float = float("-inf")
-        self._last_message: str | None = None
         try:
             self._client: Beaker | None = Beaker.from_env()
         except BeakerConfigurationError:
@@ -54,14 +53,10 @@ class BeakerStatusReporter:
         now = time.monotonic()
         if not force and now - self._last_update < self.min_interval:
             return
-        if message == self._last_message and not force:
-            return
 
         full_message = f"{message} {self._git_suffix}"
-        assert self._workload is not None
         self._client.workload.update(self._workload, description=full_message)
         self._last_update = now
-        self._last_message = message
 
     def progress_callback(self, label: str, units: str = "items/sec") -> Callable[..., None]:
         """Return a ``(count, total, *, force=False)`` callback bound to a fresh start time.
