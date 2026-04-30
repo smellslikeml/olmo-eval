@@ -10,28 +10,14 @@ Outside of a Beaker job (env var unset) the reporter is a no-op.
 
 from __future__ import annotations
 
-import importlib.util
-import logging
 import os
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from beaker import Beaker, BeakerWorkload
-
-logger = logging.getLogger(__name__)
-
-_BEAKER_AVAILABLE = importlib.util.find_spec("beaker") is not None
+from beaker import Beaker, BeakerWorkload
+from beaker.exceptions import BeakerConfigurationError
 
 DEFAULT_MIN_INTERVAL = 10.0
-
-
-def _beaker_credentials_present() -> bool:
-    if os.environ.get("BEAKER_TOKEN"):
-        return True
-    config_path = os.environ.get("BEAKER_CONFIG") or os.path.expanduser("~/.beaker/config.yml")
-    return os.path.exists(config_path)
 
 
 def _git_suffix() -> str:
@@ -45,37 +31,16 @@ class BeakerStatusReporter:
 
     def __init__(self, min_interval: float = DEFAULT_MIN_INTERVAL) -> None:
         self.min_interval = min_interval
-        self._workload_id = os.environ.get("BEAKER_WORKLOAD_ID") or os.environ.get(
-            "BEAKER_EXPERIMENT_ID"
-        )
-        has_creds = _beaker_credentials_present()
-        self.enabled = bool(self._workload_id) and _BEAKER_AVAILABLE and has_creds
-        if self._workload_id and not self.enabled:
-            missing = (
-                "beaker-py"
-                if not _BEAKER_AVAILABLE
-                else "credentials (BEAKER_TOKEN or ~/.beaker/config.yml)"
-            )
-            logger.warning(
-                "BEAKER_WORKLOAD_ID set but %s missing; Beaker status updates disabled.",
-                missing,
-            )
         self._git_suffix = _git_suffix()
-        self._client: Beaker | None = None
         self._workload: BeakerWorkload | None = None
         self._last_update: float = float("-inf")
         self._last_message: str | None = None
-
-    def _ensure_client(self) -> bool:
-        if not self.enabled or self._workload_id is None:
-            return False
-        if self._client is not None and self._workload is not None:
-            return True
-        from beaker import Beaker
-
-        self._client = Beaker.from_env()
-        self._workload = self._client.workload.get(self._workload_id)
-        return True
+        try:
+            self._client: Beaker | None = Beaker.from_env()
+        except BeakerConfigurationError:
+            self._client = None
+            return
+        self._workload = self._client.workload.get(os.environ["BEAKER_WORKLOAD_ID"])
 
     def update(self, message: str, force: bool = False) -> None:
         """Push a status message to the Beaker workload description.
@@ -83,7 +48,7 @@ class BeakerStatusReporter:
         Throttled by ``min_interval`` so callers can call this on every loop
         iteration. No-op when not running inside a Beaker job.
         """
-        if not self.enabled:
+        if self._client is None:
             return
 
         now = time.monotonic()
@@ -92,11 +57,8 @@ class BeakerStatusReporter:
         if message == self._last_message and not force:
             return
 
-        if not self._ensure_client():
-            return
-
         full_message = f"{message} {self._git_suffix}"
-        assert self._client is not None and self._workload is not None
+        assert self._workload is not None
         self._client.workload.update(self._workload, description=full_message)
         self._last_update = now
         self._last_message = message
@@ -110,7 +72,7 @@ class BeakerStatusReporter:
         start = time.monotonic()
 
         def _cb(count: int, total: int, *, force: bool = False) -> None:
-            if not self.enabled:
+            if self._client is None:
                 return
             elapsed = max(time.monotonic() - start, 1e-9)
             rate = count / elapsed
