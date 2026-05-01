@@ -50,7 +50,7 @@ class BeakerStatusReporter:
         Throttled by ``min_interval`` so callers can call this on every loop
         iteration. No-op when not running inside a Beaker job.
         """
-        if self._client is None:
+        if self._client is None or self._workload is None:
             return
 
         now = time.monotonic()
