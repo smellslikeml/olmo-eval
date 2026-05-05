@@ -3,9 +3,11 @@
       const root = document.getElementById("browser-root");
       const scopeForm = document.querySelector(".scope-form");
       const modelFilterDetails = document.getElementById("model-filter-details");
+      const modelConfigModalRoot = document.getElementById("model-config-modal-root");
       const storageBase = "pairwise-browser:" +
         (pageData.group_data?.summary?.group_name || "root") +
         ":";
+      const DOWNLOAD_NEWLINE = "\n";
       const P_INTENSITY_FLOOR = 1e-12;
       const state = {
         view: loadState("view", "matrix"),
@@ -18,11 +20,15 @@
         excludedModels: loadSetState("excludedModels"),
         hiddenCols: new Set(),
         columnsMenuOpen: false,
+        modelConfigModal: null,
       };
       let hoverPair = null;
       let pendingNavigation = false;
       let activeTableScrollDrag = null;
+      let modelConfigRequestToken = 0;
+      let modelConfigReturnFocus = null;
       const resultsScrollbarObservers = new WeakMap();
+      const modelConfigCache = new Map();
       let resultsScrollSyncQueued = false;
       let searchSelectWidthSyncQueued = false;
       const textMeasureCanvas = document.createElement("canvas");
@@ -328,12 +334,36 @@
           .replace(/'/g, "&#39;");
       }
 
+      function formatTimestampLabel(value) {
+        if (!value) return "-";
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) return String(value);
+        return parsed.toLocaleString("en-US", {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        });
+      }
+
+      function prettyJson(value) {
+        if (value === null || value === undefined) return "";
+        try {
+          return JSON.stringify(value, null, 2);
+        } catch (_error) {
+          return String(value);
+        }
+      }
+
       function isNumber(value) {
         return typeof value === "number" && Number.isFinite(value);
       }
 
       function modelKey(model) {
-        if (model?.timestamp) return modelExportRef(model);
+        if (pageData.selected_run_mode === "repeated" && model?.timestamp) {
+          return modelExportRef(model);
+        }
         return String(
           model?.model_hash ||
           model?.model_name ||
@@ -355,6 +385,23 @@
       function trimExcludedModels() {
         const validKeys = new Set(allFilterModels().map((model) => modelKey(model)));
         let changed = false;
+        if (pageData.selected_run_mode !== "repeated") {
+          const migratedKeys = [];
+          state.excludedModels.forEach((key) => {
+            const hashKey = String(key).split("|", 1)[0];
+            if (key !== hashKey && !validKeys.has(key) && validKeys.has(hashKey)) {
+              state.excludedModels.delete(key);
+              migratedKeys.push(hashKey);
+              changed = true;
+            }
+          });
+          migratedKeys.forEach((key) => {
+            if (!state.excludedModels.has(key)) {
+              state.excludedModels.add(key);
+              changed = true;
+            }
+          });
+        }
         state.excludedModels.forEach((key) => {
           if (!validKeys.has(key)) {
             state.excludedModels.delete(key);
@@ -384,6 +431,29 @@
         return fmtPct(value, digits) + " pp";
       }
 
+      function adaptiveRawDigits(value, minDigits = 1, maxDigits = minDigits + 3) {
+        if (!isNumber(value)) return minDigits;
+        const absValue = Math.abs(Number(value));
+        if (absValue === 0) return minDigits;
+        return Math.max(
+          minDigits,
+          Math.min(maxDigits, Math.ceil(-Math.log10(absValue)))
+        );
+      }
+
+      function fmtRaw(value, minDigits = 1, maxDigits = minDigits + 3) {
+        if (!isNumber(value)) return "-";
+        const numeric = Number(value);
+        const absValue = Math.abs(numeric);
+        if (absValue === 0) return (0).toFixed(minDigits);
+        if (absValue < Math.pow(10, -maxDigits)) {
+          return numeric.toExponential(1).replace(/\.0+e/, "e").replace("e+", "e");
+        }
+        const digits = adaptiveRawDigits(numeric, minDigits, maxDigits);
+        const rendered = numeric.toFixed(digits);
+        return Number(rendered) === 0 ? (0).toFixed(digits) : rendered;
+      }
+
       function fmtP(value) {
         if (!isNumber(value)) return "-";
         if (value < 0.001) return "<0.001";
@@ -409,13 +479,13 @@
       function fmtScore(value, meta, digits = 1) {
         if (!isNumber(value)) return "-";
         if (isPercentageMetric(meta)) return fmtPct(value, digits);
-        return Number(value).toFixed(digits);
+        return fmtRaw(value, digits);
       }
 
       function fmtScoreDiff(value, meta, digits = 1) {
         if (!isNumber(value)) return "-";
         if (isPercentageMetric(meta)) return fmtDiff(value, digits);
-        const rendered = Number(value).toFixed(digits);
+        const rendered = fmtRaw(value, digits);
         return value > 0 ? "+" + rendered : rendered;
       }
 
@@ -515,7 +585,7 @@
 
       function displayScore(model) {
         if (isNumber(model.display_score)) return model.display_score;
-        if (isNumber(model.avg_task_score)) return model.avg_task_score;
+        if (isNumber(model.scope_score)) return model.scope_score;
         if (isNumber(model.avg_score)) return model.avg_score;
         return null;
       }
@@ -687,27 +757,46 @@
         };
       }
 
+      function tableAggregateMeta(resultsData, columns) {
+        return resultsData?.scope_score_meta || aggregateColumnMeta(columns);
+      }
+
+      function tableAggregateLabel(resultsData) {
+        return resultsData?.scope_score_label || "avg";
+      }
+
+      function tableAggregateCsvLabel(resultsData) {
+        return resultsData?.scope_score_csv_label || tableAggregateLabel(resultsData);
+      }
+
+      function tableAggregateTitle(resultsData) {
+        return resultsData?.scope_score_title || "mean across visible task columns";
+      }
+
       function defaultScoreSortDir(meta) {
         return scoreHigherIsBetter(meta) ? "desc" : "asc";
       }
 
-      function showAverageColumn(columns) {
+      function showAggregateColumn(resultsData, scopedColumns, columns) {
+        if (resultsData?.scope_score_meta) return scopedColumns.length > 1;
         return columns.length > 1 && columnsComparable(columns);
       }
 
-      function resolvedTableSort(columns, showAverage) {
+      function resolvedTableSort(resultsData, columns, showAggregate) {
         if (state.tableSortKey === "name") {
           return { key: "name", dir: state.tableSortDir };
         }
         if (state.tableSortKey === "avg") {
-          if (showAverage) return { key: "avg", dir: state.tableSortDir };
+          if (showAggregate) return { key: "avg", dir: state.tableSortDir };
           if (columns[0]) return { key: columns[0].id, dir: defaultScoreSortDir(columns[0]) };
           return { key: "name", dir: "asc" };
         }
         if (columns.some((column) => column.id === state.tableSortKey)) {
           return { key: state.tableSortKey, dir: state.tableSortDir };
         }
-        if (showAverage) return { key: "avg", dir: defaultScoreSortDir(aggregateColumnMeta(columns)) };
+        if (showAggregate) {
+          return { key: "avg", dir: defaultScoreSortDir(tableAggregateMeta(resultsData, columns)) };
+        }
         if (columns[0]) return { key: columns[0].id, dir: defaultScoreSortDir(columns[0]) };
         return { key: "name", dir: "asc" };
       }
@@ -720,7 +809,14 @@
         if (scores.length > 0) {
           return scores.reduce((sum, value) => sum + value, 0) / scores.length;
         }
-        return displayScore(model);
+        return null;
+      }
+
+      function tableAggregateScore(model, resultsData, columns) {
+        if (resultsData?.scope_score_meta && isNumber(model.scope_score)) {
+          return model.scope_score;
+        }
+        return averageVisibleScore(model, columns);
       }
 
       function compareValues(a, b, direction) {
@@ -743,8 +839,8 @@
           }
           if (sortState.key === "avg") {
             return compareValues(
-              averageVisibleScore(left, columns),
-              averageVisibleScore(right, columns),
+              tableAggregateScore(left, resultsData, columns),
+              tableAggregateScore(right, resultsData, columns),
               sortState.dir
             );
           }
@@ -819,9 +915,9 @@
         }
         const scopedColumns = scopedTaskColumns(resultsData);
         const columns = visibleTaskColumns(resultsData);
-        const showAverage = showAverageColumn(columns);
-        const avgMeta = aggregateColumnMeta(columns);
-        const sortState = resolvedTableSort(columns, showAverage);
+        const showAggregate = showAggregateColumn(resultsData, scopedColumns, columns);
+        const aggregateMeta = tableAggregateMeta(resultsData, columns);
+        const sortState = resolvedTableSort(resultsData, columns, showAggregate);
         const rows = sortedTableRows(resultsData, filtered.indices, columns, sortState);
         return `
           <div class="table-wrap">
@@ -863,15 +959,15 @@
                           ${sortArrow("name", sortState)}
                         </span>
                       </th>
-                      ${showAverage ? `
+                      ${showAggregate ? `
                         <th
                           class="th-avg sortable ${sortState.key === "avg" ? "active" : ""}"
                           data-action="table-sort"
                           data-key="avg"
-                          title="mean across visible task columns"
+                          title="${esc(tableAggregateTitle(resultsData))}"
                         >
                           <div class="th-stack th-sort-target">
-                            <span class="th-top">avg</span>
+                            <span class="th-top">${esc(tableAggregateLabel(resultsData))}</span>
                             <span class="th-bot th-bot-arrow">${sortArrow("avg", sortState)}</span>
                           </div>
                         </th>
@@ -914,13 +1010,19 @@
                           data-model-key="${esc(modelKey(model))}"
                           title="exclude model"
                         >x</button>
-                        <span class="td-name-main">
+                        <button
+                          type="button"
+                          class="td-name-main td-name-link"
+                          data-action="open-model-config"
+                          data-model-ref="${esc(modelKey(model))}"
+                          title="view stored model config"
+                        >
                           <span class="td-name-text">${esc(model.display_label)}</span>
-                        </span>
+                        </button>
                       </td>
-                        ${showAverage ? `
+                        ${showAggregate ? `
                           <td class="td-num td-avg">
-                            ${fmtScore(averageVisibleScore(model, columns), avgMeta)}
+                            ${fmtScore(tableAggregateScore(model, resultsData, columns), aggregateMeta)}
                           </td>
                         ` : ""}
                         ${columns.map((column) => `
@@ -1179,6 +1281,16 @@
           return renderPairwiseError(errorDetails, errorMessage, pageData.group_data);
         }
         if (!pairwiseData) {
+          if (pageData.pairwise_pending) {
+            return `
+              <div class="matrix-wrap">
+                <div class="single-model-note">
+                  <div>computing paired test...</div>
+                  <div class="dim">this can take a few seconds for large suites.</div>
+                </div>
+              </div>
+            `;
+          }
           return `
             <div class="matrix-wrap">
               <div class="single-model-note">
@@ -1607,8 +1719,8 @@
                     <span class="tt-menu-n">csv</span>
                   </button>
                   <button type="button" class="tt-menu-action" data-action="export-pairwise-all">
-                    <span class="tt-menu-name">all viewer data</span>
-                    <span class="tt-menu-n">json</span>
+                    <span class="tt-menu-name">all export files</span>
+                    <span class="tt-menu-n">json + csv</span>
                   </button>
                 </div>
               </div>
@@ -1665,6 +1777,7 @@
         root.innerHTML = state.view === "matrix"
           ? renderMatrix(pairwiseData, pageData.pairwise_error, pageData.pairwise_error_details)
           : renderResults(groupData);
+        renderModelConfigModal();
         syncChrome();
         bindResultsScrollbars();
         bindColumnsMenu();
@@ -1866,13 +1979,30 @@
 
       function csvEscape(value) {
         const text = String(value ?? "");
-        return /[,"\\n]/.test(text)
+        return /[,"\n]/.test(text)
           ? '"' + text.replace(/"/g, '""') + '"'
           : text;
       }
 
+      function withTrailingDownloadNewline(contents) {
+        const text = String(contents ?? "");
+        return text.endsWith(DOWNLOAD_NEWLINE) ? text : text + DOWNLOAD_NEWLINE;
+      }
+
+      function serializeJsonDownload(payload) {
+        return withTrailingDownloadNewline(JSON.stringify(payload, null, 2));
+      }
+
+      function serializeLineDownload(lines) {
+        return withTrailingDownloadNewline(lines.join(DOWNLOAD_NEWLINE));
+      }
+
       function downloadText(filename, contents, type) {
         const blob = new Blob([contents], { type });
+        triggerBlobDownload(blob, filename);
+      }
+
+      function triggerBlobDownload(blob, filename) {
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
@@ -1901,6 +2031,255 @@
 
       function modelExportRef(model) {
         return String((model?.model_hash || "") + "|" + (model?.timestamp || ""));
+      }
+
+      function currentResultsScopeColumns() {
+        const resultsData = pageData.group_data?.results_table;
+        return resultsData ? scopedTaskColumns(resultsData) : [];
+      }
+
+      function runModeLabel() {
+        return pageData.selected_run_mode === "repeated" ? "repeated runs" : "latest only";
+      }
+
+      function modelConfigFetchUrl(modelRef) {
+        if (!pageData.selected_group || !modelRef) return null;
+        const url = new URL("/model-config", window.location.origin);
+        url.searchParams.set("group", pageData.selected_group);
+        url.searchParams.set("model_ref", modelRef);
+        if (pageData.selected_run_mode) url.searchParams.set("runs", pageData.selected_run_mode);
+        return url;
+      }
+
+      function modalMetaItem(label, value, extraClass = "") {
+        const displayValue = value === null || value === undefined || value === "" ? "-" : value;
+        return `
+          <div class="model-config-meta-item${extraClass ? " " + extraClass : ""}">
+            <div class="model-config-meta-label">${esc(label)}</div>
+            <div class="model-config-meta-value">${esc(displayValue)}</div>
+          </div>
+        `;
+      }
+
+      function closeModelConfigModal(options = {}) {
+        if (!state.modelConfigModal) return;
+        const restoreFocus = options.restoreFocus !== false;
+        state.modelConfigModal = null;
+        if (modelConfigModalRoot) modelConfigModalRoot.innerHTML = "";
+        document.body.classList.remove("has-viewer-modal");
+        if (
+          restoreFocus &&
+          modelConfigReturnFocus &&
+          typeof modelConfigReturnFocus.focus === "function"
+        ) {
+          modelConfigReturnFocus.focus();
+        }
+        modelConfigReturnFocus = null;
+      }
+
+      function renderModelConfigModal() {
+        if (!modelConfigModalRoot) return;
+        const modalState = state.modelConfigModal;
+        if (!modalState) {
+          modelConfigModalRoot.innerHTML = "";
+          document.body.classList.remove("has-viewer-modal");
+          return;
+        }
+
+        const payload = modalState.payload;
+        const scopeOption = selectedScopeOption();
+        const scopeColumns = currentResultsScopeColumns();
+        const scopeTaskCount = scopeColumns.length;
+        const scopeLabel = scopeOption
+          ? String(scopeOption.value || scopeOption.label || pageData.selected_scope_key || "selected scope")
+          : (scopeTaskCount > 0 ? "all tasks in the current results table" : "current group");
+        const modelMeta = payload?.model || {};
+        const configSource = payload?.config_source || null;
+        const fallbackNotice = configSource?.kind === "model_hash_fallback"
+          ? `
+            <div class="model-config-note">
+              displayed run has no stored config, so this uses a saved config from
+              ${esc(formatTimestampLabel(configSource.timestamp))} with the same model hash.
+            </div>
+          `
+          : "";
+        const latestOnlyNotice = (
+          pageData.selected_run_mode !== "repeated" &&
+          configSource?.kind !== "model_hash_fallback"
+        )
+          ? `
+            <div class="model-config-note">
+              latest-only rows can combine task scores from multiple runs with the same model hash.
+              the config below is the shared model config for that hash.
+            </div>
+          `
+          : "";
+
+        let body = "";
+        if (modalState.status === "loading") {
+          body = `
+            <div class="diag-card">
+              <div class="diag-kicker">loading</div>
+              <div class="diag-title">fetching the stored model config...</div>
+              <div class="diag-scope">pulling config metadata for ${esc(modalState.modelLabel)}</div>
+            </div>
+          `;
+        } else if (modalState.status === "error") {
+          body = `
+            <div class="diag-card">
+              <div class="diag-kicker">unavailable</div>
+              <div class="diag-title">could not load the stored model config</div>
+              <div class="diag-scope">${esc(modalState.error || "unknown error")}</div>
+            </div>
+          `;
+        } else if (!payload?.config) {
+          body = `
+            <div class="diag-card">
+              <div class="diag-kicker">missing</div>
+              <div class="diag-title">no stored model config was found for this model</div>
+              <div class="diag-scope">
+                the viewer has row metadata for this run, but there is no saved config payload to show.
+              </div>
+            </div>
+          `;
+        } else {
+          body = `
+            ${fallbackNotice}
+            ${latestOnlyNotice}
+            <section class="model-config-section">
+              <div class="diag-section-title">stored config</div>
+              <pre class="model-config-code"><code>${esc(prettyJson(payload.config))}</code></pre>
+            </section>
+          `;
+        }
+
+        modelConfigModalRoot.innerHTML = `
+          <div class="viewer-modal" role="presentation">
+            <button
+              type="button"
+              class="viewer-modal-backdrop"
+              data-action="close-model-config-modal"
+              aria-label="close model config"
+            ></button>
+            <div
+              class="viewer-modal-panel"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="model-config-modal-title"
+            >
+              <div class="viewer-modal-head">
+                <div class="viewer-modal-copy">
+                  <div class="diag-kicker">model config</div>
+                  <div id="model-config-modal-title" class="viewer-modal-title">
+                    ${esc(modalState.modelLabel)}
+                  </div>
+                  ${modalState.modelName && modalState.modelName !== modalState.modelLabel
+                    ? `<div class="viewer-modal-sub">${esc(modalState.modelName)}</div>`
+                    : ""}
+                </div>
+                <button
+                  type="button"
+                  class="viewer-modal-close"
+                  data-action="close-model-config-modal"
+                  aria-label="close model config"
+                >x</button>
+              </div>
+              <div class="model-config-meta-grid">
+                ${modalMetaItem("group", currentGroupName())}
+                ${modalMetaItem("scope", scopeTaskCount > 0 ? `${scopeLabel} · ${scopeTaskCount} task${scopeTaskCount === 1 ? "" : "s"}` : scopeLabel)}
+                ${modalMetaItem("runs", runModeLabel())}
+                ${modalMetaItem("timestamp", formatTimestampLabel(modelMeta.timestamp || modalState.timestamp))}
+                ${modalMetaItem("hash", modelMeta.model_hash || modalState.modelHash || "-", "is-mono")}
+                ${modalMetaItem("experiment", modelMeta.experiment_id || "-")}
+                ${modalMetaItem("backend", modelMeta.backend_name || "-")}
+              </div>
+              <div class="viewer-modal-body">
+                ${body}
+              </div>
+            </div>
+          </div>
+        `;
+        document.body.classList.add("has-viewer-modal");
+        window.requestAnimationFrame(() => {
+          modelConfigModalRoot.querySelector(".viewer-modal-close")?.focus();
+        });
+      }
+
+      async function fetchModelConfigModalData(modelRef, requestToken) {
+        const url = modelConfigFetchUrl(modelRef);
+        if (!url) {
+          state.modelConfigModal = {
+            ...(state.modelConfigModal || {}),
+            status: "error",
+            error: "missing viewer context for model config lookup",
+          };
+          renderModelConfigModal();
+          return;
+        }
+        try {
+          const response = await fetch(url.toString());
+          if (!response.ok) {
+            const message = (await response.text()).trim();
+            throw new Error(message || "failed to load model config");
+          }
+          const payload = await response.json();
+          modelConfigCache.set(modelRef, payload);
+          if (
+            !state.modelConfigModal ||
+            state.modelConfigModal.modelRef !== modelRef ||
+            requestToken !== modelConfigRequestToken
+          ) {
+            return;
+          }
+          state.modelConfigModal = {
+            ...state.modelConfigModal,
+            status: "ready",
+            payload,
+            error: null,
+          };
+        } catch (error) {
+          if (
+            !state.modelConfigModal ||
+            state.modelConfigModal.modelRef !== modelRef ||
+            requestToken !== modelConfigRequestToken
+          ) {
+            return;
+          }
+          state.modelConfigModal = {
+            ...state.modelConfigModal,
+            status: "error",
+            error: error instanceof Error ? error.message : "failed to load model config",
+          };
+        }
+        renderModelConfigModal();
+      }
+
+      function openModelConfigModal(model, trigger = null) {
+        const modelRef = modelKey(model);
+        if (!modelRef) return;
+        modelConfigReturnFocus = trigger || document.activeElement;
+        state.modelConfigModal = {
+          status: "loading",
+          modelRef,
+          modelLabel: model?.display_label || model?.model_name || model?.model_hash || "model",
+          modelName: model?.model_name || null,
+          modelHash: model?.model_hash || null,
+          timestamp: model?.timestamp || null,
+          payload: null,
+          error: null,
+        };
+        renderModelConfigModal();
+        if (modelConfigCache.has(modelRef)) {
+          state.modelConfigModal = {
+            ...state.modelConfigModal,
+            status: "ready",
+            payload: modelConfigCache.get(modelRef),
+          };
+          renderModelConfigModal();
+          return;
+        }
+        modelConfigRequestToken += 1;
+        void fetchModelConfigModalData(modelRef, modelConfigRequestToken);
       }
 
       function pairwiseExportModels(pairwiseData) {
@@ -1933,13 +2312,73 @@
         document.body.removeChild(link);
       }
 
-      async function fetchViewerExportJson(kind) {
-        const response = await fetch(pairwiseViewerExportUrl(kind, "json"));
+      let downloadToastCount = 0;
+      function getDownloadToast() {
+        let toast = document.getElementById("download-toast");
+        if (toast) return toast;
+        toast = document.createElement("div");
+        toast.id = "download-toast";
+        toast.setAttribute("role", "status");
+        toast.setAttribute("aria-live", "polite");
+        toast.style.cssText =
+          "position:fixed;right:16px;bottom:16px;z-index:9999;padding:8px 14px;" +
+          "background:#1f2937;color:#fff;border-radius:6px;font:13px/1.4 system-ui, sans-serif;" +
+          "box-shadow:0 4px 12px rgba(0,0,0,0.25);display:none;";
+        document.body.appendChild(toast);
+        return toast;
+      }
+      function showDownloadToast(message) {
+        const toast = getDownloadToast();
+        toast.textContent = message;
+        toast.style.display = "block";
+        downloadToastCount += 1;
+      }
+      function hideDownloadToast() {
+        downloadToastCount = Math.max(0, downloadToastCount - 1);
+        if (downloadToastCount === 0) {
+          const toast = document.getElementById("download-toast");
+          if (toast) toast.style.display = "none";
+        }
+      }
+
+      function filenameFromContentDisposition(header, fallback) {
+        const match = String(header || "").match(
+          /filename\*?=(?:UTF-8'')?"?([^"\n;]+)"?/i
+        );
+        if (match) {
+          try {
+            return decodeURIComponent(match[1].trim());
+          } catch (_error) {
+            return match[1].trim();
+          }
+        }
+        return fallback;
+      }
+
+      async function fetchServerExportAsset(url, label, fallbackFilename) {
+        const response = await fetch(url.toString());
         if (!response.ok) {
           const message = (await response.text()).trim();
-          throw new Error(message || "The viewer export failed.");
+          throw new Error(message || `failed to download ${label}`);
         }
-        return response.json();
+        const blob = await response.blob();
+        const filename = filenameFromContentDisposition(
+          response.headers.get("Content-Disposition"),
+          fallbackFilename
+        );
+        return { blob, filename };
+      }
+
+      async function downloadServerExport(url, label, fallbackFilename) {
+        showDownloadToast(`preparing ${label}...`);
+        try {
+          const { blob, filename } = await fetchServerExportAsset(url, label, fallbackFilename);
+          triggerBlobDownload(blob, filename);
+        } catch (error) {
+          window.alert(error instanceof Error ? error.message : `failed to download ${label}`);
+        } finally {
+          hideDownloadToast();
+        }
       }
 
       function currentPairwiseExportOrder(pairwiseData) {
@@ -2022,9 +2461,38 @@
               worst_model_score: taskStat.worst_model_score ?? null,
             }))
           : [];
+        const taskColumns = Array.isArray(pairwiseData.task_columns)
+          ? pairwiseData.task_columns
+          : [];
+        const taskNameById = new Map(
+          taskColumns.map((column) => [
+            String(column.id ?? ""),
+            String(column.full_label || column.task_name || column.id || ""),
+          ])
+        );
+        const taskHashById = new Map(
+          taskColumns.map((column) => [String(column.id ?? ""), column.task_hash ?? null])
+        );
+        const remapTaskScoresById = (taskScores) => {
+          const out = {};
+          if (!taskScores) return out;
+          for (const id of Object.keys(taskScores)) {
+            const hash = taskHashById.get(id);
+            out[hash || id] = taskScores[id];
+          }
+          return out;
+        };
+        const remapTaskScoresByName = (taskScores) => {
+          const out = {};
+          if (!taskScores) return out;
+          for (const id of Object.keys(taskScores)) {
+            const name = taskNameById.get(id) || id;
+            out[name] = taskScores[id];
+          }
+          return out;
+        };
         return {
           metadata: {
-            page_title: pairwiseData.meta.title || null,
             group_name: currentGroupName(),
             scope_name: pairwiseData.meta.scope_label || null,
             scope_kind: pairwiseData.meta.scope_kind || null,
@@ -2078,7 +2546,7 @@
               model_hash_short: model.model_hash_short || null,
               timestamp: model.timestamp || null,
               shared_instance_mean_score: model.shared_score ?? null,
-              mean_task_score: model.avg_task_score ?? null,
+              scope_aggregate_score: model.scope_score ?? null,
               bt_elo: model.strength ?? null,
               mean_pairwise_win_rate: model.avg_win_rate ?? null,
               significant_pairwise_net_wins: model.dominance ?? null,
@@ -2087,7 +2555,8 @@
               worst_scoring_task_label: model.worst_task_label ?? null,
               worst_scoring_task_score: model.worst_task_score ?? null,
               total_cost: model.cost ?? null,
-              task_scores_by_task_name: model.task_scores || {},
+              task_scores_by_task_hash: remapTaskScoresById(model.task_scores),
+              task_scores_by_task_name: remapTaskScoresByName(model.task_scores),
             };
           }),
           pairwise_comparisons: buildPairwiseExportRows(pairwiseData, order),
@@ -2117,17 +2586,22 @@
         if (!resultsData) return;
         const filtered = filteredResultsModelIndices(resultsData).indices;
         const columns = visibleTaskColumns(resultsData);
-        const showAverage = showAverageColumn(columns);
-        const avgMeta = aggregateColumnMeta(columns);
-        const sortState = resolvedTableSort(columns, showAverage);
+        const scopedColumns = scopedTaskColumns(resultsData);
+        const showAggregate = showAggregateColumn(resultsData, scopedColumns, columns);
+        const aggregateMeta = tableAggregateMeta(resultsData, columns);
+        const sortState = resolvedTableSort(resultsData, columns, showAggregate);
         const rows = sortedTableRows(resultsData, filtered, columns, sortState);
-        const header = showAverage
-          ? ["model", "avg", ...columns.map((column) => column.full_label)]
+        const header = showAggregate
+          ? [
+              "model",
+              tableAggregateCsvLabel(resultsData),
+              ...columns.map((column) => column.full_label),
+            ]
           : ["model", ...columns.map((column) => column.full_label)];
-        const body = rows.map((model) => showAverage
+        const body = rows.map((model) => showAggregate
           ? [
               model.display_label,
-              fmtScore(averageVisibleScore(model, columns), avgMeta, 2),
+              fmtScore(tableAggregateScore(model, resultsData, columns), aggregateMeta, 2),
               ...columns.map((column) => fmtScore(model.task_scores[column.id], column, 2)),
             ]
           : [
@@ -2139,7 +2613,7 @@
         );
         downloadText(
           slugify(currentGroupName(), "results") + ".csv",
-          lines.join("\\n") + "\\n",
+          serializeLineDownload(lines),
           "text/csv;charset=utf-8"
         );
       }
@@ -2194,7 +2668,7 @@
         ])].map((row) => row.map((value) => csvEscape(value)).join(","));
         downloadText(
           pairwiseExportBase(pairwiseData) + ".csv",
-          lines.join("\\n") + "\\n",
+          serializeLineDownload(lines),
           "text/csv;charset=utf-8"
         );
       }
@@ -2205,39 +2679,62 @@
         const payload = buildPairwiseExportPayload(pairwiseData);
         downloadText(
           pairwiseExportBase(pairwiseData) + ".json",
-          JSON.stringify(payload, null, 2) + "\\n",
+          serializeJsonDownload(payload),
           "application/json;charset=utf-8"
         );
       }
 
       function exportPairwiseInstanceResults() {
-        triggerDownload(pairwiseViewerExportUrl("instance-results", "csv"));
+        const pairwiseData = pageData.pairwise_data;
+        const fallback = (pairwiseData ? pairwiseExportBase(pairwiseData) : "results") +
+          "-instance-results.csv";
+        void downloadServerExport(
+          pairwiseViewerExportUrl("instance-results", "csv"),
+          "instance results CSV",
+          fallback
+        );
       }
 
       function exportPairwiseStoredFiles() {
-        triggerDownload(pairwiseViewerExportUrl("stored-files", "csv"));
+        const pairwiseData = pageData.pairwise_data;
+        const fallback = (pairwiseData ? pairwiseExportBase(pairwiseData) : "results") +
+          "-stored-files.csv";
+        void downloadServerExport(
+          pairwiseViewerExportUrl("stored-files", "csv"),
+          "stored files CSV",
+          fallback
+        );
       }
 
       async function exportPairwiseAll() {
         const pairwiseData = pageData.pairwise_data;
         if (!pairwiseData) return;
+        const base = pairwiseExportBase(pairwiseData);
+        showDownloadToast("preparing export files...");
         try {
           const [instanceResults, storedFiles] = await Promise.all([
-            fetchViewerExportJson("instance-results"),
-            fetchViewerExportJson("stored-files"),
+            fetchServerExportAsset(
+              pairwiseViewerExportUrl("instance-results", "csv"),
+              "instance results CSV",
+              base + "-instance-results.csv"
+            ),
+            fetchServerExportAsset(
+              pairwiseViewerExportUrl("stored-files", "csv"),
+              "stored files CSV",
+              base + "-stored-files.csv"
+            ),
           ]);
-          const payload = {
-            paired_test: buildPairwiseExportPayload(pairwiseData),
-            instance_results: instanceResults,
-            stored_files: storedFiles,
-          };
           downloadText(
-            pairwiseExportBase(pairwiseData) + "-all.json",
-            JSON.stringify(payload, null, 2) + "\\n",
+            base + ".json",
+            serializeJsonDownload(buildPairwiseExportPayload(pairwiseData)),
             "application/json;charset=utf-8"
           );
+          triggerBlobDownload(instanceResults.blob, instanceResults.filename);
+          triggerBlobDownload(storedFiles.blob, storedFiles.filename);
         } catch (error) {
           window.alert(error instanceof Error ? error.message : "The viewer export failed.");
+        } finally {
+          hideDownloadToast();
         }
       }
 
@@ -2335,6 +2832,12 @@
         }
       });
 
+      modelConfigModalRoot?.addEventListener("click", (event) => {
+        if (event.target.closest('[data-action="close-model-config-modal"]')) {
+          closeModelConfigModal();
+        }
+      });
+
       document.addEventListener("pointermove", (event) => {
         if (!activeTableScrollDrag) return;
         const { region, maxOffset, maxScroll, startX, startScrollLeft } = activeTableScrollDrag;
@@ -2355,6 +2858,12 @@
 
       document.addEventListener("pointerup", endTableScrollDrag);
       document.addEventListener("pointercancel", endTableScrollDrag);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && state.modelConfigModal) {
+          event.preventDefault();
+          closeModelConfigModal();
+        }
+      });
       window.addEventListener("resize", queueResultsScrollSync);
       window.addEventListener("resize", queueSearchSelectMenuWidthSync);
       document.fonts?.ready?.then(() => {
@@ -2410,6 +2919,14 @@
         const target = event.target.closest("[data-action]");
         if (!target) return;
         const action = target.dataset.action;
+        if (action === "open-model-config") {
+          const modelRef = String(target.dataset.modelRef || "");
+          const resultsData = pageData.group_data?.results_table;
+          const model = resultsData?.models?.find((entry) => modelKey(entry) === modelRef);
+          if (!model) return;
+          openModelConfigModal(model, target);
+          return;
+        }
         if (action === "matrix-sort") {
           state.matrixSort = target.dataset.kind;
           if (state.matrixSort !== "anchor") state.anchorIndex = null;
@@ -2478,7 +2995,9 @@
               const resultsTable = pageData.group_data?.results_table;
               const visibleColumns = resultsTable ? visibleTaskColumns(resultsTable) : [];
               if (key === "avg") {
-                state.tableSortDir = defaultScoreSortDir(aggregateColumnMeta(visibleColumns));
+                state.tableSortDir = defaultScoreSortDir(
+                  tableAggregateMeta(resultsTable, visibleColumns)
+                );
               } else {
                 const column = visibleColumns.find((entry) => entry.id === key);
                 state.tableSortDir = defaultScoreSortDir(column);
@@ -2554,7 +3073,93 @@
         hideTooltip();
       });
 
+      function pairwiseFetchUrl() {
+        const params = new URLSearchParams();
+        if (pageData.selected_group) params.set("group", pageData.selected_group);
+        if (pageData.selected_scope_key) params.set("scope", pageData.selected_scope_key);
+        if (pageData.selected_metric) params.set("metric", pageData.selected_metric);
+        if (pageData.selected_run_mode) params.set("runs", pageData.selected_run_mode);
+        return "/pairwise?" + params.toString();
+      }
+
+      function scopeOptionsFetchUrl() {
+        const params = new URLSearchParams();
+        if (pageData.selected_group) params.set("group", pageData.selected_group);
+        if (pageData.selected_scope_key) params.set("scope", pageData.selected_scope_key);
+        if (pageData.selected_run_mode) params.set("runs", pageData.selected_run_mode);
+        return "/scope-options?" + params.toString();
+      }
+
+      async function loadPairwiseAsync() {
+        try {
+          const response = await fetch(pairwiseFetchUrl(), {
+            headers: { Accept: "application/json" },
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          const bundle = await response.json();
+          pageData.pairwise_data = bundle.pairwise_data ?? null;
+          pageData.pairwise_error = bundle.pairwise_error ?? null;
+          pageData.pairwise_error_details = bundle.pairwise_error_details ?? null;
+        } catch (error) {
+          pageData.pairwise_data = null;
+          pageData.pairwise_error = "failed to load paired test: " + (error?.message || error);
+          pageData.pairwise_error_details = null;
+        } finally {
+          pageData.pairwise_pending = false;
+          renderApp();
+        }
+      }
+
+      function bindSearchSelectOptionHandlers(control) {
+        if (!control) return;
+        control.querySelectorAll('[data-role="search-select-option"]').forEach((option) => {
+          if (option.__searchSelectBound) return;
+          option.__searchSelectBound = true;
+          option.addEventListener("mouseenter", () => {
+            if (!option.hidden) setActiveSearchOption(control, option);
+          });
+          option.addEventListener("focus", () => {
+            if (!option.hidden) setActiveSearchOption(control, option);
+          });
+        });
+      }
+
+      async function loadScopeOptionsAsync() {
+        try {
+          const response = await fetch(scopeOptionsFetchUrl(), {
+            headers: { Accept: "application/json" },
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          const bundle = await response.json();
+          if (Array.isArray(bundle.scope_options) && pageData.group_data) {
+            pageData.group_data.scope_options = bundle.scope_options;
+          }
+          const scopeControl = scopeForm?.querySelector(".scope-select");
+          const body = scopeControl?.querySelector(".search-select-body");
+          if (body && typeof bundle.scope_select_html === "string") {
+            body.innerHTML = bundle.scope_select_html;
+            bindSearchSelectOptionHandlers(scopeControl);
+            if (scopeControl) resetSearchSelect(scopeControl);
+            queueSearchSelectMenuWidthSync();
+          }
+        } catch (_error) {
+          // Leave the partial dropdown in place; user can still navigate via URL.
+        } finally {
+          pageData.scope_options_pending = false;
+        }
+      }
+
       trimExcludedModels();
       queueSearchSelectMenuWidthSync();
       renderApp();
+      if (pageData.pairwise_pending) {
+        void loadPairwiseAsync();
+      }
+      if (pageData.scope_options_pending) {
+        void loadScopeOptionsAsync();
+      }
     })();

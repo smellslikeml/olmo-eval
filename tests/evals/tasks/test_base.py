@@ -14,7 +14,7 @@ from olmo_eval.common.metrics import AccuracyMetric, PassAtKMetric
 from olmo_eval.common.scorers import ExactMatchScorer
 from olmo_eval.common.scorers.execution import ExecutionScorer
 from olmo_eval.common.types import Instance, LMOutput, LMRequest, RequestType, Response, Split
-from olmo_eval.evals.tasks.common import Task, TaskConfig
+from olmo_eval.evals.tasks.common import OutputScoreAggregation, Task, TaskConfig
 
 
 class ConcreteTask(Task):
@@ -212,6 +212,35 @@ class TestTaskScoring:
 
         assert scored[0].scores["exact_match"] == 1.0  # Max of [0, 1, 0]
 
+    async def test_score_responses_multiple_outputs_can_take_first(self):
+        """Test that scoring can use the first sampled output like oe-eval."""
+        metric = AccuracyMetric(scorer=ExactMatchScorer)
+        config = TaskConfig(
+            name="test",
+            data_source="test/dataset",
+            metrics=(metric,),
+            output_score_aggregation=OutputScoreAggregation.FIRST,
+        )
+        task = ConcreteTask(config)
+
+        instance = Instance(question="What is 2+2?", gold_answer="4")
+        outputs = [
+            LMOutput(text="3"),  # Wrong first sample
+            LMOutput(text="4"),  # Correct later sample
+            LMOutput(text="5"),  # Wrong
+        ]
+        response = Response(
+            instance=instance,
+            request=self._make_request("What is 2+2?"),
+            outputs=outputs,
+        )
+
+        scored = await task.score_responses([response])
+
+        assert scored[0].scores["exact_match"] == 0.0
+        assert scored[0].outputs[0].metadata["score:exact_match"] == 0.0
+        assert scored[0].outputs[1].metadata["score:exact_match"] == 1.0
+
 
 @pytest.mark.anyio
 class TestTaskMetrics:
@@ -259,6 +288,44 @@ class TestTaskMetrics:
         assert "accuracy" in metrics
         assert "exact_match" in metrics["accuracy"]
         assert metrics["accuracy"]["exact_match"] == pytest.approx(2 / 3)
+
+    async def test_compute_metrics_first_sample_accuracy_with_pass_at_1(self):
+        """Accuracy can use the first sample while pass@1 still uses all samples."""
+        accuracy = AccuracyMetric(scorer=ExactMatchScorer)
+        pass_at_1 = PassAtKMetric(k=1, scorer=ExactMatchScorer)
+        config = TaskConfig(
+            name="test",
+            data_source="test/dataset",
+            metrics=(accuracy, pass_at_1),
+            output_score_aggregation=OutputScoreAggregation.FIRST,
+        )
+        task = ConcreteTask(config)
+
+        response = Response(
+            instance=Instance(question="What is 2+2?", gold_answer="4"),
+            request=self._make_request("What is 2+2?"),
+            outputs=[
+                LMOutput(text="3"),
+                LMOutput(text="4"),
+                LMOutput(text="5"),
+            ],
+        )
+
+        scored = await task.score_responses([response])
+        metrics = task.compute_metrics(scored)
+
+        assert metrics["accuracy"]["exact_match"] == 0.0
+        assert metrics["pass_at_1"]["exact_match"] == pytest.approx(1 / 3)
+
+    def test_task_config_normalizes_string_output_aggregation(self):
+        """Legacy string config values should normalize to the enum."""
+        config = TaskConfig(
+            name="test",
+            data_source="test/dataset",
+            output_score_aggregation="first",
+        )
+
+        assert config.output_score_aggregation == OutputScoreAggregation.FIRST
 
     def test_compute_metrics_empty_responses(self):
         """Test compute_metrics with empty responses."""
@@ -325,6 +392,20 @@ class _MockExecutionScorer(ExecutionScorer):
         finally:
             if self.tracker:
                 await self.tracker.exit()
+
+
+@dataclass(frozen=True, slots=True)
+class _FailingExecutionScorer(ExecutionScorer):
+    """ExecutionScorer that can fail for selected outputs."""
+
+    name: str = "failing_exec"
+    fail_text: str = "boom"
+    requires_async: ClassVar[bool] = True
+
+    async def ascore(self, instance, output, execution_env) -> float:
+        if output.text == self.fail_text:
+            raise RuntimeError("intentional scorer failure")
+        return 1.0
 
 
 class _MockExecutionEnv:
@@ -447,3 +528,58 @@ class TestExecutionConcurrency:
 
         for resp in responses:
             assert "mock_exec" in resp.scores
+
+
+@pytest.mark.anyio
+class TestAsyncScoringFailures:
+    """Tests that async scoring failures are recorded instead of dropping metrics."""
+
+    async def test_async_scorer_failure_becomes_zero_with_diagnostics(self):
+        env = _MockExecutionEnv(semaphore=asyncio.Semaphore(4))
+        scorer = _FailingExecutionScorer()
+        metric = PassAtKMetric(k=1, scorer=lambda: scorer)
+        config = TaskConfig(name="test", data_source="test/dataset", metrics=(metric,))
+        task = ConcreteTask(config)
+
+        responses = _make_responses(n_responses=2, n_outputs=1)
+        responses[0].outputs[0].text = "ok"
+        responses[1].outputs[0].text = "boom"
+        context = ScoringContext(execution_env=env, scoring_concurrency=8)
+
+        scored = await task.score_responses(responses, context=context)
+
+        assert scored[0].scores["failing_exec"] == 1.0
+        assert scored[0].outputs[0].metadata["score:failing_exec"] == 1.0
+        assert "scoring_errors" not in scored[0].outputs[0].metadata
+
+        failing_output = scored[1].outputs[0]
+        assert scored[1].scores["failing_exec"] == 0.0
+        assert failing_output.metadata["score:failing_exec"] == 0.0
+        assert failing_output.metadata["scoring_errors"] == {
+            "failing_exec": {
+                "phase": "execution",
+                "type": "RuntimeError",
+                "message": "intentional scorer failure",
+            }
+        }
+
+    async def test_partial_async_failures_preserve_passing_outputs(self):
+        env = _MockExecutionEnv(semaphore=asyncio.Semaphore(4))
+        scorer = _FailingExecutionScorer()
+        metric = PassAtKMetric(k=1, scorer=lambda: scorer)
+        config = TaskConfig(name="test", data_source="test/dataset", metrics=(metric,))
+        task = ConcreteTask(config)
+
+        response = _make_responses(n_responses=1, n_outputs=2)[0]
+        response.outputs[0].text = "ok"
+        response.outputs[1].text = "boom"
+        context = ScoringContext(execution_env=env, scoring_concurrency=8)
+
+        scored = await task.score_responses([response], context=context)
+
+        assert scored[0].scores["failing_exec"] == 1.0
+        assert scored[0].outputs[0].metadata["score:failing_exec"] == 1.0
+        assert scored[0].outputs[1].metadata["score:failing_exec"] == 0.0
+        assert scored[0].outputs[1].metadata["scoring_errors"]["failing_exec"]["type"] == (
+            "RuntimeError"
+        )

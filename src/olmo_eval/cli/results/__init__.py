@@ -19,4 +19,11 @@ results.add_command(suites)
 results.add_command(groups)
 results.add_command(group)
 
-__all__ = ["results", "query", "viewer", "suites", "groups", "group"]
+__all__ = [
+    "results",
+    "query",
+    "viewer",
+    "suites",
+    "groups",
+    "group",
+]

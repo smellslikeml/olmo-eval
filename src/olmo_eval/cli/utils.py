@@ -102,6 +102,7 @@ HARNESS_CONFIG_FIELDS = frozenset(
         "sandboxes",
         "scaffold_kwargs",
         "sandbox_pool_instances",
+        "sandbox_pool_min_instances",
         "metrics",
         "batching",
         "scorer_startup_timeout",
@@ -123,6 +124,7 @@ TASK_CONFIG_FIELDS = frozenset(
         "primary_metric",
         "sampling_params",
         "dependencies",
+        "sandbox_allocation_weight",
         "priority",  # Special: extracted for job priority, not a real TaskConfig field
     }
 )

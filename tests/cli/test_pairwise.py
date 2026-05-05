@@ -40,12 +40,33 @@ class _StaticExecuteResult:
         return list(self._rows)
 
 
+class _StaticLookupResult:
+    def __init__(self, row):
+        self._row = row
+
+    def first(self):
+        return self._row
+
+    def one_or_none(self):
+        return self._row
+
+
 class _StaticTaskSession:
     def __init__(self, rows):
         self._rows = list(rows)
 
     def execute(self, _query):
         return _StaticExecuteResult(self._rows)
+
+
+class _SequentialExecuteSession:
+    def __init__(self, results):
+        self._results = list(results)
+
+    def execute(self, _query):
+        if not self._results:
+            raise AssertionError("unexpected execute() call")
+        return self._results.pop(0)
 
 
 def _build_pairwise_result(*, dropped: int = 0) -> PairwiseResult:
@@ -88,6 +109,31 @@ def _extract_browser_payload(html: str) -> dict[str, Any]:
     match = _BROWSER_PAYLOAD_RE.search(html)
     assert match is not None, "RESULTS_VIEWER_DATA payload not found in viewer HTML"
     return json.loads(match.group("payload"))
+
+
+def test_task_scope_key_uses_task_name_unless_hash_qualified() -> None:
+    viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
+
+    assert (
+        viewer_server._task_scope_key(
+            {
+                "name": "hellaswag:rc:olmo3base",
+                "task_hash": "b480b4ea63abf387",
+                "hash_qualified": False,
+            }
+        )
+        == "task::hellaswag:rc:olmo3base"
+    )
+    assert (
+        viewer_server._task_scope_key(
+            {
+                "name": "duplicate-task",
+                "task_hash": "abc12345deadbeef",
+                "hash_qualified": True,
+            }
+        )
+        == "task-hash::abc12345deadbeef"
+    )
 
 
 def test_results_viewer_json_blob_forwards_exclude_filters(monkeypatch) -> None:
@@ -335,19 +381,154 @@ def test_build_results_table_keep_all_preserves_distinct_reruns(monkeypatch) -> 
 
     assert len(latest_table["models"]) == 1
     assert len(all_runs_table["models"]) == 2
+    assert viewer_server._model_key(latest_table["models"][0]) == "abc12345deadbeef"
     assert (
         all_runs_table["models"][0]["display_label"] != all_runs_table["models"][1]["display_label"]
     )
     assert "2026-04-21 12:00" in all_runs_table["models"][0]["display_label"]
     assert "2026-04-21 08:00" in all_runs_table["models"][1]["display_label"]
     assert (
-        viewer_server._model_key(all_runs_table["models"][0])
+        viewer_server._model_key(all_runs_table["models"][0], selected_run_mode="repeated")
         == "abc12345deadbeef|2026-04-21T12:00:00+00:00"
     )
     assert (
-        viewer_server._model_key(all_runs_table["models"][1])
+        viewer_server._model_key(all_runs_table["models"][1], selected_run_mode="repeated")
         == "abc12345deadbeef|2026-04-21T08:00:00+00:00"
     )
+
+
+def test_load_results_model_config_bundle_prefers_displayed_run_config(monkeypatch) -> None:
+    viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
+
+    displayed = SimpleNamespace(
+        id=11,
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        timestamp=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+    )
+    detail_row = SimpleNamespace(
+        id=11,
+        experiment_id="exp-11",
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        model_config={"provider": {"name": "openai"}, "model": "model-a"},
+        backend_name="openai",
+        timestamp=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+    )
+
+    monkeypatch.setattr(
+        viewer_server,
+        "_group_experiments",
+        lambda session, group_name, keep_all: [displayed],
+    )
+
+    bundle = viewer_server._load_results_model_config_bundle(
+        _SequentialExecuteSession([_StaticLookupResult(detail_row)]),
+        group_name="my-group",
+        model_ref="abc12345deadbeef",
+        keep_all=False,
+    )
+
+    assert bundle["has_config"] is True
+    assert bundle["config"] == {"provider": {"name": "openai"}, "model": "model-a"}
+    assert bundle["config_source"]["kind"] == "display_run"
+    assert bundle["config_source"]["experiment_id"] == "exp-11"
+    assert bundle["model"]["experiment_pk"] == 11
+    assert bundle["model"]["model_hash_short"] == "abc12345"
+
+
+def test_load_results_model_config_bundle_falls_back_to_same_hash(monkeypatch) -> None:
+    viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
+
+    displayed = SimpleNamespace(
+        id=11,
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        timestamp=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+    )
+    display_row = SimpleNamespace(
+        id=11,
+        experiment_id="exp-11",
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        model_config=None,
+        backend_name="openai",
+        timestamp=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+    )
+    fallback_row = SimpleNamespace(
+        id=10,
+        experiment_id="exp-10",
+        timestamp=datetime(2026, 4, 21, 8, 0, tzinfo=UTC),
+        model_config={"provider": {"name": "openai"}, "model": "model-a"},
+    )
+
+    monkeypatch.setattr(
+        viewer_server,
+        "_group_experiments",
+        lambda session, group_name, keep_all: [displayed],
+    )
+
+    bundle = viewer_server._load_results_model_config_bundle(
+        _SequentialExecuteSession(
+            [
+                _StaticLookupResult(display_row),
+                _StaticLookupResult(fallback_row),
+            ]
+        ),
+        group_name="my-group",
+        model_ref="abc12345deadbeef|2026-04-21T12:00:00+00:00",
+        keep_all=False,
+    )
+
+    assert bundle["has_config"] is True
+    assert bundle["config"] == {"provider": {"name": "openai"}, "model": "model-a"}
+    assert bundle["config_source"]["kind"] == "model_hash_fallback"
+
+
+def test_load_results_model_config_bundle_repeated_runs_still_require_exact_ref(
+    monkeypatch,
+) -> None:
+    viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
+
+    first = SimpleNamespace(
+        id=10,
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        timestamp=datetime(2026, 4, 21, 8, 0, tzinfo=UTC),
+    )
+    second = SimpleNamespace(
+        id=11,
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        timestamp=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+    )
+    detail_row = SimpleNamespace(
+        id=10,
+        experiment_id="exp-10",
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        model_config={"provider": {"name": "openai"}, "model": "model-a"},
+        backend_name="openai",
+        timestamp=datetime(2026, 4, 21, 8, 0, tzinfo=UTC),
+    )
+
+    monkeypatch.setattr(
+        viewer_server,
+        "_group_experiments",
+        lambda session, group_name, keep_all: [second, first],
+    )
+
+    bundle = viewer_server._load_results_model_config_bundle(
+        _SequentialExecuteSession([_StaticLookupResult(detail_row)]),
+        group_name="my-group",
+        model_ref="abc12345deadbeef|2026-04-21T08:00:00+00:00",
+        keep_all=True,
+    )
+
+    assert bundle["has_config"] is True
+    assert bundle["model"]["experiment_pk"] == 10
+    assert bundle["config_source"]["experiment_id"] == "exp-10"
+    assert bundle["config_source"]["timestamp"] == "2026-04-21T08:00:00+00:00"
 
 
 def test_build_results_table_metric_options_do_not_double_count_primary_metric(
@@ -393,6 +574,127 @@ def test_build_results_table_metric_options_do_not_double_count_primary_metric(
     assert metric_option_by_value["accuracy:exact_match"]["model_count"] == 1
     assert metric_option_by_value["accuracy:exact_match"]["meta"] == "1 model"
     assert metric_option_by_value["f1:exact_match"]["model_count"] == 1
+
+
+def test_build_results_table_latest_mode_merges_partial_runs_by_model_and_task_hash(
+    monkeypatch,
+) -> None:
+    viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
+
+    latest_experiment = SimpleNamespace(
+        id=11,
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        timestamp=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+    )
+    older_experiment = SimpleNamespace(
+        id=10,
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        timestamp=datetime(2026, 4, 21, 8, 0, tzinfo=UTC),
+    )
+
+    monkeypatch.setattr(
+        viewer_server,
+        "_group_experiments",
+        lambda session, group_name, keep_all: (
+            [latest_experiment, older_experiment] if keep_all else [latest_experiment]
+        ),
+    )
+
+    results_table = viewer_server._build_results_table(
+        _StaticTaskSession(
+            [
+                (
+                    10,
+                    "task-a",
+                    "task-hash-a",
+                    {"accuracy": {"exact_match": 0.40}},
+                    "accuracy:exact_match",
+                ),
+                (
+                    11,
+                    "task-b",
+                    "task-hash-b",
+                    {"accuracy": {"exact_match": 0.80}},
+                    "accuracy:exact_match",
+                ),
+            ]
+        ),
+        "my-group",
+        keep_all=False,
+    )
+
+    assert len(results_table["models"]) == 1
+    column_id_by_name = {
+        column["task_name"]: column["id"] for column in results_table["task_columns"]
+    }
+    task_scores = results_table["models"][0]["task_scores"]
+
+    assert task_scores[column_id_by_name["task-a"]] == pytest.approx(0.40)
+    assert task_scores[column_id_by_name["task-b"]] == pytest.approx(0.80)
+    assert results_table["models"][0]["avg_score"] == pytest.approx(0.60)
+
+
+def test_build_results_table_latest_mode_keeps_unique_older_metrics_and_latest_duplicates(
+    monkeypatch,
+) -> None:
+    viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
+
+    latest_experiment = SimpleNamespace(
+        id=11,
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        timestamp=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+    )
+    older_experiment = SimpleNamespace(
+        id=10,
+        model_name="model-a",
+        model_hash="abc12345deadbeef",
+        timestamp=datetime(2026, 4, 21, 8, 0, tzinfo=UTC),
+    )
+
+    monkeypatch.setattr(
+        viewer_server,
+        "_group_experiments",
+        lambda session, group_name, keep_all: (
+            [latest_experiment, older_experiment] if keep_all else [latest_experiment]
+        ),
+    )
+
+    results_table = viewer_server._build_results_table(
+        _StaticTaskSession(
+            [
+                (
+                    10,
+                    "gsm8k:olmo3base",
+                    "task-hash-11",
+                    {
+                        "accuracy": {"exact_match": 0.60},
+                        "f1": {"exact_match": 0.72},
+                    },
+                    "accuracy:exact_match",
+                ),
+                (
+                    11,
+                    "gsm8k:olmo3base",
+                    "task-hash-11",
+                    {"accuracy": {"exact_match": 0.65}},
+                    "accuracy:exact_match",
+                ),
+            ]
+        ),
+        "my-group",
+        keep_all=False,
+    )
+
+    task_column = results_table["task_columns"][0]
+    metric_option_by_value = {option["value"]: option for option in task_column["metric_options"]}
+
+    assert task_column["metric"] == "accuracy:exact_match"
+    assert metric_option_by_value["accuracy:exact_match"]["model_count"] == 1
+    assert metric_option_by_value["f1:exact_match"]["model_count"] == 1
+    assert results_table["models"][0]["task_scores"][task_column["id"]] == pytest.approx(0.65)
 
 
 def test_build_results_table_splits_same_name_tasks_by_hash(monkeypatch) -> None:
@@ -488,6 +790,94 @@ def test_model_filter_score_label_uses_selected_scope_columns() -> None:
     assert viewer_server._model_filter_score_label(model, scoped_columns) == "50.0%"
 
 
+def test_results_table_scope_score_uses_suite_aggregation_strategy() -> None:
+    viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
+    from olmo_eval.evals.suites.registry import _REGISTRY, AggregationStrategy, Suite
+
+    nested_suite = Suite(
+        name="_test_nested_results_table",
+        tasks=("task_a", "task_b", "task_c"),
+        aggregation=AggregationStrategy.AVERAGE,
+    )
+    aoa_suite = Suite(
+        name="_test_aoa_results_table",
+        tasks=("task_single", nested_suite),
+        aggregation=AggregationStrategy.AVERAGE_OF_AVERAGES,
+    )
+    _REGISTRY["_test_aoa_results_table"] = aoa_suite
+
+    try:
+        selected_scope_option = {
+            "key": "suite::_test_aoa_results_table",
+            "kind": "suite",
+            "value": "_test_aoa_results_table",
+            "task_ids": ["task_single", "task_a", "task_b", "task_c"],
+        }
+        results_table = {
+            "models": [
+                {
+                    "index": 0,
+                    "display_label": "model-a",
+                    "avg_score": 0.625,
+                    "task_scores": {
+                        "task_single": 1.0,
+                        "task_a": 0.4,
+                        "task_b": 0.5,
+                        "task_c": 0.6,
+                    },
+                }
+            ],
+            "task_columns": [
+                {
+                    "id": "task_single",
+                    "task_name": "task_single",
+                    "score_display_format": "percentage",
+                    "score_unit": "proportion",
+                    "higher_is_better": True,
+                },
+                {
+                    "id": "task_a",
+                    "task_name": "task_a",
+                    "score_display_format": "percentage",
+                    "score_unit": "proportion",
+                    "higher_is_better": True,
+                },
+                {
+                    "id": "task_b",
+                    "task_name": "task_b",
+                    "score_display_format": "percentage",
+                    "score_unit": "proportion",
+                    "higher_is_better": True,
+                },
+                {
+                    "id": "task_c",
+                    "task_name": "task_c",
+                    "score_display_format": "percentage",
+                    "score_unit": "proportion",
+                    "higher_is_better": True,
+                },
+            ],
+        }
+
+        annotated = viewer_server._annotate_results_table_scope_scores(
+            results_table,
+            selected_scope_key="suite::_test_aoa_results_table",
+            selected_scope_option=selected_scope_option,
+        )
+
+        assert annotated is not None
+        assert annotated["scope_score_label"] == "agg"
+        assert annotated["models"][0]["avg_score"] == pytest.approx(0.625)
+        assert annotated["models"][0]["scope_score"] == pytest.approx(0.75)
+
+        scoped_columns = viewer_server._scoped_task_columns(annotated, selected_scope_option)
+        assert viewer_server._model_filter_score_label(annotated["models"][0], scoped_columns) == (
+            "75.0%"
+        )
+    finally:
+        del _REGISTRY["_test_aoa_results_table"]
+
+
 def test_model_filter_score_label_formats_raw_metrics_and_hides_mixed_units() -> None:
     viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
 
@@ -524,6 +914,22 @@ def test_model_filter_score_label_formats_raw_metrics_and_hides_mixed_units() ->
 
     assert viewer_server._model_filter_score_label(model, raw_columns) == "0.5"
     assert viewer_server._model_filter_score_label(model, mixed_columns) == "—"
+
+
+def test_format_score_value_keeps_small_raw_values_visible() -> None:
+    viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
+
+    raw_meta = {
+        "score_display_format": "raw",
+        "score_unit": "bits_per_byte",
+        "higher_is_better": False,
+    }
+
+    assert viewer_server._format_score_value(0.41, raw_meta) == "0.4"
+    assert viewer_server._format_score_value(0.04, raw_meta) == "0.04"
+    assert viewer_server._format_score_value(0.004, raw_meta) == "0.004"
+    assert viewer_server._format_score_value(-0.04, raw_meta) == "-0.04"
+    assert viewer_server._format_score_value(0.00009, raw_meta) == "9e-5"
 
 
 def test_results_viewer_rejects_removed_plot_format() -> None:
@@ -654,7 +1060,203 @@ def test_serialize_viewer_export_supports_csv_and_json() -> None:
 
     assert filename == "my-group-my-scope-stored-files.json"
     assert content_type == "application/json; charset=utf-8"
-    assert '"predictions_file": "s3://bucket/predictions.jsonl"' in body.decode("utf-8")
+    decoded = body.decode("utf-8")
+    assert decoded.endswith("\n")
+    assert json.loads(decoded) == {
+        "metadata": {"group_name": "my-group"},
+        "rows": [
+            {
+                "model_display_rank": 1,
+                "task_name": "gsm8k:olmo3base",
+                "predictions_file": "s3://bucket/predictions.jsonl",
+            }
+        ],
+    }
+
+
+def test_browser_exports_use_real_newlines_for_downloads() -> None:
+    assets = importlib.import_module("olmo_eval.analysis.pairwise_viewer.assets")
+
+    script = assets.browser_js_text()
+
+    assert "function serializeJsonDownload(payload)" in script
+    assert "function serializeLineDownload(lines)" in script
+    assert 'join("\\\\n")' not in script
+    assert '+ "\\\\n"' not in script
+    assert 'return /[,"\\\\n]/.test(text)' not in script
+
+
+def test_latest_only_exports_merge_source_rows_back_to_display_models() -> None:
+    viewer_server = importlib.import_module("olmo_eval.cli.results.viewer_server")
+
+    compared_experiments = [
+        {
+            "experiment_pk": 10,
+            "model_name": "model-a",
+            "model_hash": "hash-a",
+            "timestamp": "2026-04-21T00:00:00+00:00",
+            "results_root": "s3://bucket/model-a/latest",
+            "display_rank": 1,
+            "display_label": "model-a (hash-a)",
+        },
+        {
+            "experiment_pk": 20,
+            "model_name": "model-b",
+            "model_hash": "hash-b",
+            "timestamp": "2026-04-21T01:00:00+00:00",
+            "results_root": "s3://bucket/model-b/latest",
+            "display_rank": 2,
+            "display_label": "model-b (hash-b)",
+        },
+    ]
+    source_experiments = [
+        SimpleNamespace(
+            id=10,
+            model_name="model-a",
+            model_hash="hash-a",
+            timestamp=datetime(2026, 4, 21, tzinfo=UTC),
+            s3_location="s3://bucket/model-a/latest",
+        ),
+        SimpleNamespace(
+            id=11,
+            model_name="model-a",
+            model_hash="hash-a",
+            timestamp=datetime(2026, 4, 20, tzinfo=UTC),
+            s3_location="s3://bucket/model-a/older",
+        ),
+        SimpleNamespace(
+            id=20,
+            model_name="model-b",
+            model_hash="hash-b",
+            timestamp=datetime(2026, 4, 21, 1, tzinfo=UTC),
+            s3_location="s3://bucket/model-b/latest",
+        ),
+        SimpleNamespace(
+            id=21,
+            model_name="model-b",
+            model_hash="hash-b",
+            timestamp=datetime(2026, 4, 20, 1, tzinfo=UTC),
+            s3_location="s3://bucket/model-b/older",
+        ),
+    ]
+    result = SimpleNamespace(
+        suite_name="olmobase:mcqa_non_stem",
+        task_name="olmobase:mcqa_non_stem",
+        task_names=("mmlu_history",),
+        task_hashes=("task-hash-1",),
+        metric="accuracy:exact_match",
+        score_display_format="percentage",
+        score_unit="proportion",
+        higher_is_better=True,
+    )
+    session = _SequentialExecuteSession(
+        [
+            _StaticExecuteResult(
+                [
+                    SimpleNamespace(
+                        experiment_pk=11,
+                        task_name="mmlu_history",
+                        task_hash="task-hash-1",
+                        num_instances=1,
+                        metrics={"accuracy": {"exact_match": 1.0}},
+                        primary_metric="accuracy:exact_match",
+                        s3_metrics_key="s3://bucket/model-a/task-metrics.json",
+                        s3_predictions_key="s3://bucket/model-a/predictions.jsonl",
+                        s3_requests_key="s3://bucket/model-a/requests.jsonl",
+                    ),
+                    SimpleNamespace(
+                        experiment_pk=21,
+                        task_name="mmlu_history",
+                        task_hash="task-hash-1",
+                        num_instances=1,
+                        metrics={"accuracy": {"exact_match": 0.0}},
+                        primary_metric="accuracy:exact_match",
+                        s3_metrics_key="s3://bucket/model-b/task-metrics.json",
+                        s3_predictions_key="s3://bucket/model-b/predictions.jsonl",
+                        s3_requests_key="s3://bucket/model-b/requests.jsonl",
+                    ),
+                ]
+            ),
+            _StaticExecuteResult(
+                [
+                    SimpleNamespace(
+                        experiment_pk=11,
+                        native_id="doc-1",
+                        task_hash="task-hash-1",
+                        raw_score=1.0,
+                    ),
+                    SimpleNamespace(
+                        experiment_pk=21,
+                        native_id="doc-1",
+                        task_hash="task-hash-1",
+                        raw_score=0.0,
+                    ),
+                ]
+            ),
+        ]
+    )
+
+    task_rows = viewer_server._load_compared_scope_task_rows(
+        session,
+        compared_experiments=compared_experiments,
+        source_experiments=source_experiments,
+        result=result,
+        keep_all=False,
+    )
+
+    assert task_rows == [
+        {
+            "experiment_pk": 10,
+            "task_name": "mmlu_history",
+            "task_hash": "task-hash-1",
+            "num_instances": 1,
+            "primary_metric": "accuracy:exact_match",
+            "task_metrics_file": "s3://bucket/model-a/task-metrics.json",
+            "predictions_file": "s3://bucket/model-a/predictions.jsonl",
+            "requests_file": "s3://bucket/model-a/requests.jsonl",
+        },
+        {
+            "experiment_pk": 20,
+            "task_name": "mmlu_history",
+            "task_hash": "task-hash-1",
+            "num_instances": 1,
+            "primary_metric": "accuracy:exact_match",
+            "task_metrics_file": "s3://bucket/model-b/task-metrics.json",
+            "predictions_file": "s3://bucket/model-b/predictions.jsonl",
+            "requests_file": "s3://bucket/model-b/requests.jsonl",
+        },
+    ]
+
+    metadata, rows = viewer_server._build_instance_results_export_data(
+        session,
+        group_name="my-group",
+        result=result,
+        compared_experiments=compared_experiments,
+        source_experiments=source_experiments,
+        task_rows=task_rows,
+        selected_metric=None,
+        keep_all=False,
+    )
+
+    assert metadata["shared_instance_count"] == 1
+    assert len(rows) == 2
+    assert [row["model_display_rank"] for row in rows] == [1, 2]
+    assert [row["native_id"] for row in rows] == ["doc-1", "doc-1"]
+    assert [row["raw_score"] for row in rows] == [1.0, 0.0]
+
+    _, stored_rows = viewer_server._build_stored_files_export_data(
+        group_name="my-group",
+        result=result,
+        compared_experiments=compared_experiments,
+        task_rows=task_rows,
+        selected_metric=None,
+    )
+
+    assert [row["model_display_rank"] for row in stored_rows] == [1, 2]
+    assert [row["predictions_file"] for row in stored_rows] == [
+        "s3://bucket/model-a/predictions.jsonl",
+        "s3://bucket/model-b/predictions.jsonl",
+    ]
 
 
 def test_render_results_viewer_page_renders_core_viewer_state_and_controls() -> None:
@@ -779,11 +1381,14 @@ def test_render_results_viewer_page_renders_core_viewer_state_and_controls() -> 
     assert 'data-search-select="scope"' in html
     assert 'placeholder="search groups..."' in html
     assert 'placeholder="search suites or tasks..."' in html
+    assert 'id="model-config-modal-root"' in html
     assert "olmobase:math (2 tasks) · N=6252" in html
     assert "MDE80" in html
     assert 'id="model-filter-summary"' in html
     assert 'data-action="toggle-model-checkbox"' in html
     assert 'data-model-key="abc12345"' in html
+    assert 'data-action="open-model-config"' in html
+    assert 'new URL("/model-config", window.location.origin)' in html
 
     for action in (
         "export-pairwise-csv",
@@ -793,6 +1398,7 @@ def test_render_results_viewer_page_renders_core_viewer_state_and_controls() -> 
         "export-pairwise-all",
     ):
         assert f'data-action="{action}"' in html
+    assert "all export files" in html
 
     assert "paired test" in html
     assert "Δ (row − col)" in html

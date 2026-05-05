@@ -32,6 +32,42 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _format_scoring_error(exc: Exception, *, phase: str) -> dict[str, str]:
+    """Build a JSON-serializable scoring error payload."""
+    error = {
+        "phase": phase,
+        "type": type(exc).__qualname__,
+    }
+    message = str(exc).strip()
+    if message:
+        error["message"] = message
+    return error
+
+
+def _record_scoring_failure(
+    response: Response,
+    *,
+    scorer_names: list[str],
+    error: dict[str, str],
+) -> Response:
+    """Annotate a response when scoring aborts before per-output results exist."""
+    for scorer_name in scorer_names:
+        response.scores.setdefault(scorer_name, 0.0)
+
+    for output in response.outputs:
+        if output.metadata is None:
+            output.metadata = {}
+        existing = output.metadata.get("scoring_errors")
+        if not isinstance(existing, dict):
+            existing = {}
+            output.metadata["scoring_errors"] = existing
+        existing["__response__"] = error
+        for scorer_name in scorer_names:
+            output.metadata.setdefault(f"score:{scorer_name}", 0.0)
+
+    return response
+
+
 async def process_results(
     trackers: dict[str, TaskTracker],
     result_queue: mp.Queue,
@@ -43,6 +79,8 @@ async def process_results(
     model_name: str,
     save_predictions: bool,
     write_predictions_fn: Any,
+    save_requests: bool,
+    write_requests_fn: Any,
 ) -> dict[str, TaskResult]:
     """Process results from workers with inline async scoring.
 
@@ -116,6 +154,9 @@ async def process_results(
                 write_predictions_fn(
                     model_name, task_result.spec, task_result.predictions, task_hash
                 )
+            if save_requests and task_result.requests:
+                task_hash = compute_task_hash(task_result.config)
+                write_requests_fn(model_name, task_result.spec, task_result.requests, task_hash)
 
     async def score_and_store(
         spec: str,
@@ -129,8 +170,18 @@ async def process_results(
                 scored_list = await task.score_responses([response], context=scoring_context)
                 scored = scored_list[0] if scored_list else response
             except Exception as e:
-                logger.warning(f"Failed to score {spec}[{instance_idx}]: {e}")
-                scored = response
+                error = _format_scoring_error(e, phase="response")
+                logger.warning(
+                    "Failed to score %s[%s]: %s",
+                    spec,
+                    instance_idx,
+                    error.get("message", error["type"]),
+                )
+                scored = _record_scoring_failure(
+                    response,
+                    scorer_names=list(task._get_scorers()),
+                    error=error,
+                )
 
         scored_responses[spec][instance_idx] = scored
         instances_scored[spec] += 1
@@ -217,6 +268,7 @@ async def process_results(
             request=result_item.request,
             outputs=result_item.outputs,
             trajectory=trajectory,
+            request_trace=result_item.request_trace,
         )
 
         # Score inline as an async task

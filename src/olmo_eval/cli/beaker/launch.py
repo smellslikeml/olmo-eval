@@ -1007,11 +1007,11 @@ def _apply_harness_overrides(harness_config, overrides: list[str]):
         harness_config: Base HarnessConfig to modify.
         overrides: List of dotlist override strings (e.g., ["sandbox.mode=docker"]).
             Supports list indices like "sandboxes.0.mode=modal".
-            Supports JSON values like 'sandboxes.0={"mode":"modal","instances":4}'.
+            Supports JSON values like 'sandboxes.0={"mode":"modal"}'.
             Supports shared sandbox overrides like
-            'sandboxes={"mode":"modal","instances":64}' where non-instance
-            fields are applied to each sandbox config and instances sets the
-            shared sandbox pool budget.
+            'sandboxes={"mode":"modal","instances":64,"min_instances":24}'
+            where non-pool fields are applied to each sandbox config and
+            instances/min_instances set the shared sandbox pool budget/minimum.
 
     Returns:
         New HarnessConfig with overrides applied.
