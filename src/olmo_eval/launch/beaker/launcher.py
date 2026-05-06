@@ -527,6 +527,12 @@ def normalize_provider_package(package: str) -> str:
     # Strip any install flags first
     pkg_spec, _ = parse_install_spec(package)
 
+    # Named direct references ("name @ url") should preserve the package name
+    # while still normalizing the URL/source portion.
+    if " @ " in pkg_spec:
+        name, source = pkg_spec.split(" @ ", 1)
+        return f"{name} @ {normalize_provider_package(source)}"
+
     # Already a git+ URL, return as-is
     if pkg_spec.startswith("git+"):
         return pkg_spec
@@ -539,7 +545,85 @@ def normalize_provider_package(package: str) -> str:
     return pkg_spec
 
 
-def build_install_command(package: str, constraints: str | None = None) -> str:
+def _infer_install_target_name_from_normalized(package: str) -> str | None:
+    """Infer a distribution name from an already-normalized package spec."""
+    normalized = package
+
+    # PEP 508 direct references: "name @ URL"
+    if " @ " in normalized:
+        return normalized.split(" @ ", 1)[0].strip() or None
+
+    # Direct URLs and local paths: prefer an explicit egg fragment, otherwise
+    # fall back to the trailing path component (e.g., transformers.git -> transformers).
+    if normalized.startswith("git+") or "://" in normalized or normalized.startswith("/"):
+        match = re.search(r"(?:[#&]egg=)([A-Za-z0-9_.-]+)", normalized)
+        if match:
+            return match.group(1)
+
+        path_part = normalized.split("#", 1)[0].rsplit("/", 1)[-1]
+        if "@" in path_part:
+            path_part = path_part.split("@", 1)[0]
+        if path_part.endswith(".git"):
+            path_part = path_part[:-4]
+        return path_part or None
+
+    match = re.match(r"^\s*([A-Za-z0-9_.-]+)", normalized)
+    return match.group(1) if match else None
+
+
+def bind_direct_source_to_package(package: str) -> str:
+    """Attach a direct source URL/path to an inferred package name when possible.
+
+    uv's resolver pins URL dependencies when the URL is declared for a specific
+    package (for example, ``transformers @ git+https://...``). Provider overrides
+    are intended to replace an existing package, so we make that association
+    explicit for direct-source specs.
+    """
+    normalized = normalize_provider_package(package)
+    if " @ " in normalized or not is_direct_source_package(normalized):
+        return normalized
+
+    package_name = _infer_install_target_name_from_normalized(normalized)
+    if package_name:
+        return f"{package_name} @ {normalized}"
+    return normalized
+
+
+def infer_install_target_name(package: str) -> str | None:
+    """Infer the distribution name for a package specifier.
+
+    This is used to target uv's package-specific reinstall flags when a runtime
+    dependency should override an already-installed distribution.
+
+    Args:
+        package: Package specifier with or without install flags.
+
+    Returns:
+        Best-effort inferred distribution name, or None if it cannot be derived.
+    """
+    pkg_spec, _ = parse_install_spec(package)
+    normalized = bind_direct_source_to_package(pkg_spec)
+    return _infer_install_target_name_from_normalized(normalized)
+
+
+def is_direct_source_package(package: str) -> bool:
+    """Whether a package spec resolves from a direct source instead of an index."""
+    pkg_spec, _ = parse_install_spec(package)
+    normalized = normalize_provider_package(pkg_spec)
+    return (
+        normalized.startswith("git+")
+        or " @ " in normalized
+        or "://" in normalized
+        or normalized.startswith("/")
+    )
+
+
+def build_install_command(
+    package: str,
+    constraints: str | None = None,
+    venv_path: str | None = None,
+    force_reinstall: bool = False,
+) -> str:
     """Build a uv pip install command for a package with optional flags.
 
     Handles package specifiers that include install flags like --no-build-isolation.
@@ -547,14 +631,44 @@ def build_install_command(package: str, constraints: str | None = None) -> str:
     Args:
         package: Package specifier with optional install flags.
         constraints: Optional constraints file path.
+        venv_path: Optional virtualenv path to target via `uv pip --python`.
+        force_reinstall: Whether to force a provider override to replace an
+            existing installed distribution in the target environment.
 
     Returns:
         Complete uv pip install command string.
     """
     pkg_spec, flags = parse_install_spec(package)
-    normalized = normalize_provider_package(pkg_spec)
+    normalized = (
+        bind_direct_source_to_package(pkg_spec)
+        if force_reinstall
+        else normalize_provider_package(pkg_spec)
+    )
 
-    cmd_parts = ["uv", "pip", "install"]
+    cmd_parts = ["uv"]
+    if force_reinstall and is_direct_source_package(normalized):
+        # Provider source overrides should not inherit the repo's uv config or
+        # a shared cache entry that can silently re-lay an old wheel.
+        cmd_parts.extend(["--no-config", "--no-cache"])
+    cmd_parts.extend(["pip", "install"])
+    if venv_path:
+        cmd_parts.extend(["--python", f"{venv_path}/bin/python"])
+    reinstall_flags = {
+        "--force-reinstall",
+        "--refresh",
+        "--refresh-package",
+        "--reinstall",
+        "--reinstall-package",
+    }
+    if force_reinstall and not any(flag in reinstall_flags for flag in flags):
+        if is_direct_source_package(normalized):
+            cmd_parts.append("--refresh")
+        package_name = infer_install_target_name(normalized)
+        if package_name:
+            cmd_parts.extend(["--refresh-package", package_name])
+            cmd_parts.extend(["--reinstall-package", package_name])
+        else:
+            cmd_parts.extend(["--refresh", "--reinstall"])
     cmd_parts.extend(flags)
     cmd_parts.append(f"'{normalized}'")
     if constraints:
@@ -670,7 +784,8 @@ class BeakerLauncher:
             Shell command string for installation.
         """
         has_vllm = "vllm" in extras
-        use_isolated_vllm_venv = has_vllm and vllm_isolated_venv
+        use_isolated_vllm_venv = vllm_isolated_venv and (has_vllm or bool(provider_packages))
+        vllm_venv: str | None = None
 
         # Build the install steps
         # Export UV_PROJECT_ENVIRONMENT so all uv commands use Docker's /opt/venv
@@ -714,11 +829,15 @@ class BeakerLauncher:
                 f"/opt/venv/lib/python*/site-packages/nvidia*; do "
                 f'ln -sf "$pkg" {vllm_venv}/lib/python*/site-packages/; done'
             )
-            # Install vLLM extra from project (no torch constraint - it's symlinked)
-            steps.append(
-                f"cd /gantry-runtime && VIRTUAL_ENV={vllm_venv} uv pip install "
-                f"--cache-dir \"$UV_CACHE_DIR\" -e '.[vllm]'"
-            )
+            # Install the project's bundled vLLM dependency set when requested.
+            # Custom provider packages (e.g., a vLLM fork) are installed below
+            # into the same isolated environment.
+            if has_vllm:
+                steps.append(
+                    f"cd /gantry-runtime && uv pip install "
+                    f"--python {vllm_venv}/bin/python "
+                    f"--cache-dir \"$UV_CACHE_DIR\" -e '.[vllm]'"
+                )
             # Set VLLM_PYTHON so VLLMServerProcess uses the isolated venv
             steps.append(f"export VLLM_PYTHON={vllm_venv}/bin/python")
 
@@ -743,7 +862,14 @@ class BeakerLauncher:
         # Install provider-specific dependencies
         if provider_packages:
             for pkg in provider_packages:
-                steps.append(build_install_command(pkg, constraints))
+                steps.append(
+                    build_install_command(
+                        pkg,
+                        constraints,
+                        venv_path=vllm_venv if use_isolated_vllm_venv else None,
+                        force_reinstall=True,
+                    )
+                )
 
         # Install task-specific dependencies
         if task_packages:
