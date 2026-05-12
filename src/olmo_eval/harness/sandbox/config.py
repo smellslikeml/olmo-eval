@@ -54,6 +54,9 @@ class Capability:
     DEFAULT: frozenset[str] = BASH
 
 
+DEFAULT_MAX_CONCURRENCY = 4
+
+
 @hide_unset()
 @dataclass(frozen=True)
 class SandboxConfig:
@@ -63,8 +66,13 @@ class SandboxConfig:
         image: Container image for the sandbox environment.
         mode: How to run the sandbox.
         capabilities: Capabilities this sandbox provides (e.g., {"bash"}).
-        instances: Number of executor instances to create from this config.
+        instances: Explicit number of executor instances to create from this config.
+            When None, the caller can auto-allocate capacity; consumers that do
+            not perform allocation fall back to one executor.
             Multiple instances enable higher throughput via round-robin.
+        max_concurrency: Maximum concurrent operations per executor instance.
+            Total concurrent sandbox operations for a capability set is
+            max_concurrency * (number of running instances).
         min_instances: Minimum instances that must start successfully.
             None (default) means all instances are required. Set to a lower
             value to allow partial failures during startup.
@@ -88,7 +96,8 @@ class SandboxConfig:
     image: str
     mode: SandboxMode
     capabilities: frozenset[str] = Capability.DEFAULT
-    instances: int = 1
+    instances: int | None = None
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     min_instances: int | None = None
     container_runtime: ContainerRuntime = "podman"
     startup_timeout: float = 60.0
@@ -113,6 +122,18 @@ class SandboxConfig:
     def is_local(self) -> bool:
         """True if sandbox runs locally (docker/local), False if remote (modal)."""
         return self.mode in (SandboxMode.LOCAL, SandboxMode.DOCKER)
+
+    @property
+    def resolved_instances(self) -> int:
+        """Executor count with the default auto-allocation fallback applied."""
+        return self.instances if self.instances is not None else 1
+
+    @property
+    def resolved_min_instances(self) -> int:
+        """Minimum required instances, clamped to the resolved executor count."""
+        if self.min_instances is None:
+            return self.resolved_instances
+        return min(self.min_instances, self.resolved_instances)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -139,7 +160,8 @@ class SandboxConfig:
             image=data["image"],
             mode=SandboxMode(data["mode"]),
             capabilities=frozenset(capabilities) if capabilities else Capability.DEFAULT,
-            instances=data.get("instances", 1),
+            instances=data.get("instances"),
+            max_concurrency=data.get("max_concurrency", DEFAULT_MAX_CONCURRENCY),
             min_instances=data.get("min_instances"),
             container_runtime=data.get("container_runtime", "podman"),
             startup_timeout=data.get("startup_timeout", 60.0),

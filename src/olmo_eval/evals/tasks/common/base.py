@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from olmo_eval.common.formatters import Formatter
@@ -26,6 +30,45 @@ from olmo_eval.common.types import (
 if TYPE_CHECKING:
     from olmo_eval.common.execution import ScoringContext
     from olmo_eval.data import DataSource
+
+logger = logging.getLogger(__name__)
+
+
+def _format_scoring_error(exc: Exception, *, phase: str) -> dict[str, str]:
+    """Build a JSON-serializable scoring error payload."""
+    error = {
+        "phase": phase,
+        "type": type(exc).__qualname__,
+    }
+    message = str(exc).strip()
+    if message:
+        error["message"] = message
+    return error
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxEnv:
+    """Named sandbox environment with dependencies for code execution scoring.
+
+    Tasks sharing the same name share a container. Different names get
+    isolated containers with only their declared dependencies installed.
+    """
+
+    name: str
+    dependencies: tuple[str, ...] = ()
+    dockerfile_extra: tuple[str, ...] = ()
+
+    @property
+    def capability(self) -> frozenset[str]:
+        """Capability tag used to route execution to this sandbox."""
+        return frozenset({f"sandbox:{self.name}"})
+
+
+class OutputScoreAggregation(StrEnum):
+    """How per-output scorer values collapse to a response-level score."""
+
+    MAX = "max"
+    FIRST = "first"
 
 
 @hide_unset()
@@ -64,10 +107,44 @@ class TaskConfig:
     split: Split = Split.TEST
     primary_metric: MetricName | Metric | None = None
     sampling_params: SamplingParams | None = None
+    output_score_aggregation: OutputScoreAggregation = OutputScoreAggregation.MAX
+
+    #: Maximum prompt length in tokens for loglikelihood truncation (matches oe-eval max_length).
+    #: When set, prompts exceeding this length are left-truncated before scoring.
+    max_length: int | None = None
     answer_extractor: Callable[[str], str] | None = None
 
     #: Runtime dependencies to install for this task (package specs like "pkg==1.0" or git URLs)
     dependencies: list[str] | None = None
+
+    #: Sandbox environment for code execution scoring. None = use default sandbox.
+    sandbox_env: SandboxEnv | None = None
+
+    #: Scheduler-only weight hint for shared sandbox allocation.
+    sandbox_allocation_weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        """Validate scheduler-only sandbox allocation hints."""
+        if isinstance(self.output_score_aggregation, str):
+            try:
+                self.output_score_aggregation = OutputScoreAggregation(
+                    self.output_score_aggregation
+                )
+            except ValueError as exc:
+                valid = ", ".join(option.value for option in OutputScoreAggregation)
+                raise ValueError(
+                    f"output_score_aggregation must be one of: {valid}; "
+                    f"got {self.output_score_aggregation!r}"
+                ) from exc
+
+        try:
+            weight = float(self.sandbox_allocation_weight)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("sandbox_allocation_weight must be a positive finite float") from exc
+
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError("sandbox_allocation_weight must be a positive finite float")
+        self.sandbox_allocation_weight = weight
 
     def get_data_source(self, split: str | None = None) -> DataSource:
         """Get the data source for a specific split.
@@ -153,6 +230,8 @@ class TaskConfig:
             "split": self.split.value,
             "primary_metric": serialize_primary_metric(self.get_primary_metric()),
             "sampling_params": asdict(self.sampling_params) if self.sampling_params else None,
+            "output_score_aggregation": self.output_score_aggregation.value,
+            "max_length": self.max_length,
             "answer_extractor": getattr(self.answer_extractor, "__name__", None),
             "dependencies": self.dependencies,
         }
@@ -460,7 +539,7 @@ class Task(ABC):
                     if output.metadata is None:
                         output.metadata = {}
                     output.metadata[f"score:{scorer.name}"] = scores[i] if i < len(scores) else 0.0
-                response.scores[scorer.name] = max(scores) if scores else 0.0
+                response.scores[scorer.name] = self._aggregate_output_scores(scores)
 
     async def _apply_scorers_async(
         self,
@@ -491,13 +570,20 @@ class Task(ABC):
         execution_env = context.execution_env if context.has_execution_env else None
         scorers_by_name = self._get_scorers()
 
+        # Route to task-specific sandbox if sandbox_env is configured
+        sandbox_cap = self.config.sandbox_env.capability if self.config.sandbox_env else None
+        if sandbox_cap and execution_env is not None and hasattr(execution_env, "get_executor"):
+            task_executor = execution_env.get_executor(sandbox_cap)  # ty: ignore[call-non-callable]
+        else:
+            task_executor = execution_env
+
         # Separate scorers by type: execution (sandbox), context (LLM judge), sync
         execution_scorers: dict[str, ExecutionScorer] = {}
         context_scorers: dict[str, ContextScorer] = {}
         sync_scorers: dict[str, Scorer] = {}
         for name, scorer in scorers_by_name.items():
             if isinstance(scorer, ExecutionScorer):
-                if execution_env is None:
+                if task_executor is None:
                     raise SandboxRequiredError(
                         f"{scorer.__class__.__name__} requires a sandbox. "
                         "Configure sandboxes in HarnessConfig."
@@ -517,32 +603,69 @@ class Task(ABC):
                     if output.metadata is None:
                         output.metadata = {}
                     output.metadata[f"score:{scorer.name}"] = scores[i] if i < len(scores) else 0.0
-                response.scores[scorer.name] = max(scores) if scores else 0.0
+                response.scores[scorer.name] = self._aggregate_output_scores(scores)
 
         # Apply async scorers (both execution and context) concurrently
         async_scorers_exist = bool(execution_scorers) or bool(context_scorers)
         if async_scorers_exist:
-            semaphore = asyncio.Semaphore(context.scoring_concurrency)
+            # Shared semaphore for sandbox execution — scoped by capability, sized
+            # to max_concurrency * running_instances. Prevents overloading the pool.
+            exec_semaphore: asyncio.Semaphore | contextlib.nullcontext[None] = (
+                contextlib.nullcontext()
+            )
+            if execution_env is not None and hasattr(execution_env, "get_execution_semaphore"):
+                from olmo_eval.harness.sandbox.config import Capability
+
+                sem = execution_env.get_execution_semaphore(sandbox_cap or Capability.DEFAULT)  # ty: ignore[call-non-callable]
+                if sem is not None:
+                    exec_semaphore = sem
+
+            # Per-call semaphore for context scorers (LLM judges) — they don't
+            # consume sandbox slots so per-call throttling is appropriate.
+            ctx_semaphore = asyncio.Semaphore(context.scoring_concurrency)
 
             async def score_execution(
                 resp_idx: int, scorer: ExecutionScorer, out_idx: int
-            ) -> tuple[int, str, int, float]:
-                async with semaphore:
-                    response = responses[resp_idx]
-                    output = response.outputs[out_idx]
-                    # execution_env is guaranteed non-None since we raise SandboxRequiredError above
-                    assert execution_env is not None
-                    score = await scorer.ascore(response.instance, output, execution_env)
-                    return (resp_idx, scorer.name, out_idx, score)
+            ) -> tuple[int, str, int, float, dict[str, str] | None]:
+                response = responses[resp_idx]
+                output = response.outputs[out_idx]
+                try:
+                    async with exec_semaphore:
+                        assert task_executor is not None
+                        score = await scorer.ascore(response.instance, output, task_executor)
+                except Exception as exc:
+                    error = _format_scoring_error(exc, phase="execution")
+                    instance_id = response.instance.metadata.get("id", str(resp_idx))
+                    logger.warning(
+                        "Async scoring failed for instance %s output %s with scorer %s: %s",
+                        instance_id,
+                        out_idx,
+                        scorer.name,
+                        error.get("message", error["type"]),
+                    )
+                    return (resp_idx, scorer.name, out_idx, 0.0, error)
+                return (resp_idx, scorer.name, out_idx, score, None)
 
             async def score_context(
                 resp_idx: int, scorer: ContextScorer, out_idx: int
-            ) -> tuple[int, str, int, float]:
-                async with semaphore:
-                    response = responses[resp_idx]
-                    output = response.outputs[out_idx]
-                    score = await scorer.ascore_with_context(response.instance, output, context)
-                    return (resp_idx, scorer.name, out_idx, score)
+            ) -> tuple[int, str, int, float, dict[str, str] | None]:
+                response = responses[resp_idx]
+                output = response.outputs[out_idx]
+                try:
+                    async with ctx_semaphore:
+                        score = await scorer.ascore_with_context(response.instance, output, context)
+                except Exception as exc:
+                    error = _format_scoring_error(exc, phase="context")
+                    instance_id = response.instance.metadata.get("id", str(resp_idx))
+                    logger.warning(
+                        "Context scoring failed for instance %s output %s with scorer %s: %s",
+                        instance_id,
+                        out_idx,
+                        scorer.name,
+                        error.get("message", error["type"]),
+                    )
+                    return (resp_idx, scorer.name, out_idx, 0.0, error)
+                return (resp_idx, scorer.name, out_idx, score, None)
 
             tasks = []
             for resp_idx, response in enumerate(responses):
@@ -561,14 +684,21 @@ class Task(ABC):
             # Store individual scores in output metadata for pass@k expansion
             # Structure: {resp_idx: {scorer_name: {out_idx: score}}}
             scores_by_response: dict[int, dict[str, dict[int, float]]] = {}
-            for resp_idx, scorer_name, out_idx, score in results:
+            scoring_errors_by_response: dict[int, dict[int, dict[str, dict[str, str]]]] = {}
+            for resp_idx, scorer_name, out_idx, score, scoring_error in results:
                 if resp_idx not in scores_by_response:
                     scores_by_response[resp_idx] = {}
                 if scorer_name not in scores_by_response[resp_idx]:
                     scores_by_response[resp_idx][scorer_name] = {}
                 scores_by_response[resp_idx][scorer_name][out_idx] = score
+                if scoring_error is not None:
+                    if resp_idx not in scoring_errors_by_response:
+                        scoring_errors_by_response[resp_idx] = {}
+                    if out_idx not in scoring_errors_by_response[resp_idx]:
+                        scoring_errors_by_response[resp_idx][out_idx] = {}
+                    scoring_errors_by_response[resp_idx][out_idx][scorer_name] = scoring_error
 
-            # Store individual scores in output metadata and assign max to response
+            # Store individual scores in output metadata and aggregate to response
             for resp_idx, scorer_scores in scores_by_response.items():
                 response = responses[resp_idx]
                 for scorer_name, output_scores in scorer_scores.items():
@@ -578,9 +708,38 @@ class Task(ABC):
                         if output.metadata is None:
                             output.metadata = {}
                         output.metadata[f"score:{scorer_name}"] = score
-                    # Response-level score is max for backward compatibility
-                    all_scores = list(output_scores.values())
-                    response.scores[scorer_name] = max(all_scores) if all_scores else 0.0
+                        if (
+                            resp_idx in scoring_errors_by_response
+                            and out_idx in scoring_errors_by_response[resp_idx]
+                            and scorer_name in scoring_errors_by_response[resp_idx][out_idx]
+                        ):
+                            existing = output.metadata.get("scoring_errors")
+                            if not isinstance(existing, dict):
+                                existing = {}
+                                output.metadata["scoring_errors"] = existing
+                            existing[scorer_name] = scoring_errors_by_response[resp_idx][out_idx][
+                                scorer_name
+                            ]
+                    response.scores[scorer_name] = self._aggregate_output_scores(output_scores)
+
+    def _aggregate_output_scores(self, scores: Sequence[float] | dict[int, float]) -> float:
+        """Collapse per-output scorer values into one response-level score."""
+        aggregation = self.config.output_score_aggregation
+        ordered_scores: list[float]
+        if isinstance(scores, Sequence):
+            ordered_scores = list(scores)
+            if not ordered_scores:
+                return 0.0
+        else:
+            if not scores:
+                return 0.0
+            ordered_scores = [scores[index] for index in sorted(scores)]
+
+        if aggregation == OutputScoreAggregation.MAX:
+            return max(ordered_scores)
+        if aggregation == OutputScoreAggregation.FIRST:
+            return ordered_scores[0]
+        raise ValueError(f"Unsupported output_score_aggregation: {aggregation}")
 
     def _expand_multi_output_responses(self, responses: Sequence[Response]) -> list[Response]:
         """Expand multi-output responses into individual responses for pass@k.

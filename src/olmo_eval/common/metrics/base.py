@@ -40,11 +40,77 @@ class Metric(ABC):
         """Compute aggregate metric from scored responses."""
         ...
 
+    def compute_instance(self, response: Response) -> float | None:
+        """Compute the per-instance value that should back exact metric storage.
+
+        The default path is conservative:
+        - if a task stores its exact per-instance metric directly in ``response.scores``
+          under the metric name, prefer that;
+        - otherwise, only reuse the scorer channel when pairwise scorer fallback is valid.
+
+        Metrics with richer per-instance semantics should override this method.
+        """
+        metric_value = response.scores.get(self.name)
+        if isinstance(metric_value, (int, float)):
+            return float(metric_value)
+
+        if not self.supports_pairwise_scorer_fallback():
+            return None
+
+        try:
+            scorer_name = self.scorer().name
+        except Exception:
+            return None
+        scorer_value = response.scores.get(scorer_name)
+        if isinstance(scorer_value, (int, float)):
+            return float(scorer_value)
+        return None
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a dictionary."""
         scorer = self.scorer
         scorer_name = scorer.__name__ if isinstance(scorer, type) else type(scorer).__name__
         return {"type": self.__class__.__name__, "name": self.name, "scorer": scorer_name}
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        """Whether scorer-level instance values match the metric's per-instance signal.
+
+        Pairwise analysis sometimes has to fall back from an exact per-instance metric key
+        (for example ``accuracy:exact_match``) to the stored scorer channel
+        (for example ``exact_match:exact_match``). That fallback is only valid when the
+        task-level metric is literally an average of per-instance scorer values.
+
+        Metrics that aggregate across multiple continuations, weight instances unevenly,
+        or otherwise derive the final value from richer response structure should override
+        this to ``False``.
+        """
+        return True
+
+    def pairwise_higher_is_better(self) -> bool:
+        """Whether larger metric values mean better model quality."""
+        return True
+
+    def pairwise_display_format(self) -> str:
+        """Return the preferred viewer formatting family for this metric.
+
+        ``percentage`` means the metric is naturally interpreted on a 0-1 scale and
+        should be rendered as percentages / percentage-point deltas. ``raw`` means the
+        metric should stay in its native numeric units.
+        """
+        percentage_names = {"accuracy", "f1", "recall", "tool_accuracy"}
+        if self.name in percentage_names:
+            return "percentage"
+        if self.name.endswith("_accuracy"):
+            return "percentage"
+        if self.name.startswith("pass_at_") or self.name.startswith("pass_pow_"):
+            return "percentage"
+        return "raw"
+
+    def pairwise_unit(self) -> str:
+        """Return the unit family used to decide whether suite pooling is comparable."""
+        if self.pairwise_display_format() == "percentage":
+            return "proportion"
+        return self.name
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,9 +223,8 @@ class RecallMetric(Metric):
 class BPBMetricInstanceAvg(Metric):
     """Arithmetic mean of per-instance bits-per-byte.
 
-    Each instance's BPB is computed independently via the scorer, then averaged
-    with equal weight regardless of text length.  This matches the aggregation
-    used by oe-eval (simple mean of per-doc ``bits_per_byte_corr``).
+    Computes per-instance BPB as: -logprob / (num_bytes * log(2)),
+    then returns the simple (unweighted) mean across all instances.
     """
 
     name: str = "bits_per_byte"
@@ -182,6 +247,19 @@ class BPBMetricInstanceAvg(Metric):
             return 0.0
 
         return sum(bpb_values) / len(bpb_values)
+
+    def compute_instance(self, response: Response) -> float | None:
+        output = _select_gold_output(response)
+        if output is None:
+            return None
+        return float(self.scorer().score(response.instance, output))
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        # Keep BPB handling conservative: pairwise should read the exact stored metric key.
+        return False
+
+    def pairwise_higher_is_better(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +298,20 @@ class BPBMetricByteAvg(Metric):
             return 0.0
 
         return weighted_sum / total_bytes
+
+    def compute_instance(self, response: Response) -> float | None:
+        output = _select_gold_output(response)
+        if output is None:
+            return None
+        return float(self.scorer().score(response.instance, output))
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        # Byte-weighted BPB is a corpus aggregate, so scorer-level per-instance values
+        # are not equivalent to the stored task metric.
+        return False
+
+    def pairwise_higher_is_better(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +354,27 @@ class MeanPerplexityMetric(Metric):
 
         return total / len(responses)
 
+    def compute_instance(self, response: Response) -> float | None:
+        outputs = response.outputs
+        if not outputs:
+            return None
+
+        if len(outputs) > 1:
+            gold_idx = response.instance.metadata.get("gold_idx")
+            if gold_idx is not None and 0 <= gold_idx < len(outputs):
+                output = outputs[gold_idx]
+            else:
+                output = outputs[0]
+        else:
+            output = outputs[0]
+
+        if output.logprobs is None:
+            return None
+        return float(self.scorer().score(response.instance, output))
+
+    def pairwise_higher_is_better(self) -> bool:
+        return False
+
 
 @dataclass(frozen=True, slots=True)
 class PassAtKMetric(Metric):
@@ -275,6 +388,7 @@ class PassAtKMetric(Metric):
     scorer: type[Scorer] = field(kw_only=True)
 
     def __post_init__(self) -> None:
+        # Use unique name per k value so metrics don't overwrite each other
         object.__setattr__(self, "name", f"pass_at_{self.k}")
 
     def compute(self, responses: Sequence[Response]) -> float:
@@ -309,6 +423,30 @@ class PassAtKMetric(Metric):
 
         return sum(pass_at_k_values) / len(pass_at_k_values) if pass_at_k_values else 0.0
 
+    def compute_instance(self, response: Response) -> float | None:
+        scorer_name = self.scorer().name
+        score_key = f"score:{scorer_name}"
+        sample_scores: list[float] = []
+        for output in response.outputs:
+            score = (output.metadata or {}).get(score_key)
+            if isinstance(score, (int, float)):
+                sample_scores.append(float(score))
+
+        if not sample_scores:
+            scorer_score = response.scores.get(scorer_name)
+            if isinstance(scorer_score, (int, float)) and len(response.outputs) <= 1:
+                sample_scores.append(float(scorer_score))
+
+        if not sample_scores:
+            return None
+
+        n = len(sample_scores)
+        c = sum(1 for score in sample_scores if score > 0.5)
+        return float(compute_pass_at_k(n, c, min(self.k, n)))
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        return self.k == 1
+
 
 @dataclass(frozen=True, slots=True)
 class PassPowKMetric(Metric):
@@ -322,6 +460,7 @@ class PassPowKMetric(Metric):
     scorer: type[Scorer] = field(kw_only=True)
 
     def __post_init__(self) -> None:
+        # Use unique name per k value so metrics don't overwrite each other
         object.__setattr__(self, "name", f"pass_pow_{self.k}")
 
     def compute(self, responses: Sequence[Response]) -> float:
@@ -356,6 +495,30 @@ class PassPowKMetric(Metric):
 
         return sum(pass_pow_k_values) / len(pass_pow_k_values) if pass_pow_k_values else 0.0
 
+    def compute_instance(self, response: Response) -> float | None:
+        scorer_name = self.scorer().name
+        score_key = f"score:{scorer_name}"
+        sample_scores: list[float] = []
+        for output in response.outputs:
+            score = (output.metadata or {}).get(score_key)
+            if isinstance(score, (int, float)):
+                sample_scores.append(float(score))
+
+        if not sample_scores:
+            scorer_score = response.scores.get(scorer_name)
+            if isinstance(scorer_score, (int, float)) and len(response.outputs) <= 1:
+                sample_scores.append(float(scorer_score))
+
+        if not sample_scores:
+            return None
+
+        n = len(sample_scores)
+        c = sum(1 for score in sample_scores if score > 0.5)
+        return float(compute_pass_pow_k(n, c, self.k))
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        return self.k == 1
+
 
 @dataclass(frozen=True, slots=True)
 class LogprobMCAccuracyMetric(Metric):
@@ -381,6 +544,17 @@ class LogprobMCAccuracyMetric(Metric):
             if logprob_sums.index(max(logprob_sums)) == gold_idx:
                 correct += 1
         return correct / len(responses)
+
+    def compute_instance(self, response: Response) -> float | None:
+        gold_idx = response.instance.metadata.get("gold_idx")
+        if gold_idx is None or not response.outputs:
+            return None
+        scorer = self.scorer()
+        logprob_sums = [scorer.score(response.instance, output) for output in response.outputs]
+        return 1.0 if logprob_sums.index(max(logprob_sums)) == gold_idx else 0.0
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +599,29 @@ class LogprobUncondMCAccuracyMetric(Metric):
                 correct += 1
         return correct / len(responses)
 
+    def compute_instance(self, response: Response) -> float | None:
+        gold_idx = response.instance.metadata.get("gold_idx")
+        num_choices = response.instance.metadata.get("num_choices")
+        if gold_idx is None or num_choices is None or not response.outputs:
+            return None
+        outputs = response.outputs
+        cond_outputs = outputs[:num_choices]
+        uncond_outputs = outputs[num_choices:]
+        if len(cond_outputs) != len(uncond_outputs) or not cond_outputs:
+            return None
+
+        scores: list[float] = []
+        for cond, uncond in zip(cond_outputs, uncond_outputs, strict=True):
+            if cond.logprobs is None or uncond.logprobs is None:
+                return None
+            cond_lp = sum(lp["logprob"] for lp in cond.logprobs)
+            uncond_lp = sum(lp["logprob"] for lp in uncond.logprobs)
+            scores.append(cond_lp - uncond_lp)
+        return 1.0 if scores.index(max(scores)) == gold_idx else 0.0
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        return False
+
 
 @dataclass(frozen=True, slots=True)
 class LogprobPerCharMCAccuracyMetric(Metric):
@@ -459,6 +656,21 @@ class LogprobPerCharMCAccuracyMetric(Metric):
                 correct += 1
         return correct / len(responses)
 
+    def compute_instance(self, response: Response) -> float | None:
+        gold_idx = response.instance.metadata.get("gold_idx")
+        if gold_idx is None or not response.outputs:
+            return None
+        scorer = self.scorer()
+        logprob_per_char: list[float] = []
+        for output in response.outputs:
+            total_logprob = scorer.score(response.instance, output)
+            num_chars = max(len(output.text) if output.text else 0, 1)
+            logprob_per_char.append(total_logprob / num_chars)
+        return 1.0 if logprob_per_char.index(max(logprob_per_char)) == gold_idx else 0.0
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        return False
+
 
 @dataclass(frozen=True, slots=True)
 class LogprobPerTokenMCAccuracyMetric(Metric):
@@ -492,6 +704,21 @@ class LogprobPerTokenMCAccuracyMetric(Metric):
                 correct += 1
         return correct / len(responses)
 
+    def compute_instance(self, response: Response) -> float | None:
+        gold_idx = response.instance.metadata.get("gold_idx")
+        if gold_idx is None or not response.outputs:
+            return None
+        scorer = self.scorer()
+        logprob_per_token: list[float] = []
+        for output in response.outputs:
+            total_logprob = scorer.score(response.instance, output)
+            num_tokens = max(len(output.logprobs) if output.logprobs else 0, 1)
+            logprob_per_token.append(total_logprob / num_tokens)
+        return 1.0 if logprob_per_token.index(max(logprob_per_token)) == gold_idx else 0.0
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        return False
+
 
 @dataclass(frozen=True, slots=True)
 class GreedyAccuracyMetric(Metric):
@@ -522,6 +749,17 @@ class GreedyAccuracyMetric(Metric):
                 if output.metadata.get("is_greedy", False):
                     correct += 1
         return correct / len(responses)
+
+    def compute_instance(self, response: Response) -> float | None:
+        if not response.outputs:
+            return None
+        gold_idx = response.instance.metadata.get("gold_idx", 0)
+        if gold_idx >= len(response.outputs):
+            return None
+        return 1.0 if response.outputs[gold_idx].metadata.get("is_greedy", False) else 0.0
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,6 +812,22 @@ class CorpusPerplexityMetric(Metric):
 
         avg_logprob = total_logprob / total_tokens
         return math.exp(-avg_logprob)
+
+    def compute_instance(self, response: Response) -> float | None:
+        if not response.outputs:
+            return None
+        output = response.outputs[0]
+        if output.logprobs is None or not output.logprobs:
+            return None
+        total_logprob = self.scorer().score(response.instance, output)
+        avg_logprob = total_logprob / len(output.logprobs)
+        return float(math.exp(-avg_logprob))
+
+    def supports_pairwise_scorer_fallback(self) -> bool:
+        return False
+
+    def pairwise_higher_is_better(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True, slots=True)

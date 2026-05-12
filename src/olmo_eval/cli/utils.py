@@ -1,12 +1,15 @@
 """Shared utilities for the CLI."""
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import click
-from rich.console import Console
+
+from olmo_eval.common import types
+from olmo_eval.common.console import console
 
 if TYPE_CHECKING:
     from olmo_eval.evals.external.base import ExternalEval
@@ -14,9 +17,6 @@ if TYPE_CHECKING:
     from olmo_eval.harness import HarnessConfig
     from olmo_eval.inference.providers.config import ProviderConfig
     from olmo_eval.launch.beaker.launcher import BeakerJobConfig
-
-
-console = Console(force_terminal=True, width=120)
 
 
 @dataclass
@@ -94,13 +94,15 @@ HARNESS_CONFIG_FIELDS = frozenset(
         "tools",
         "system_prompt",
         "tool_choice",
-        "backend",
+        "scaffold",
         "required_secrets",
         "max_turns",
         "max_concurrency",
         "scoring_concurrency",
         "sandboxes",
-        "backend_kwargs",
+        "scaffold_kwargs",
+        "sandbox_pool_instances",
+        "sandbox_pool_min_instances",
         "metrics",
         "batching",
         "scorer_startup_timeout",
@@ -122,6 +124,7 @@ TASK_CONFIG_FIELDS = frozenset(
         "primary_metric",
         "sampling_params",
         "dependencies",
+        "sandbox_allocation_weight",
         "priority",  # Special: extracted for job priority, not a real TaskConfig field
     }
 )
@@ -170,10 +173,12 @@ def process_ordered_args(
 
             # Apply to task or harness with validation
             if last_flag == "t" and current_task:
-                if top_key not in TASK_CONFIG_FIELDS:
+                sampling_fields = {f.name for f in dataclasses.fields(types.SamplingParams)}
+                if top_key not in TASK_CONFIG_FIELDS and top_key not in sampling_fields:
                     raise click.UsageError(
-                        f"Invalid task override: '{top_key}' is not a TaskConfig field. "
-                        f"Did you mean to put this after --harness instead of -t?"
+                        f"Invalid task override: '{top_key}' is not a TaskConfig or "
+                        f"SamplingParams field. Did you mean to put this after --harness "
+                        f"instead of -t?"
                     )
                 task_overrides[current_task].append(arg.value)
             elif last_flag == "h":
@@ -233,14 +238,16 @@ def _coerce_value(value: str) -> Any:
 
     Handles booleans, integers, floats, JSON objects/arrays, and plain strings.
     """
-    # Booleans
+    # JSON scalar literals
     if value.lower() == "true":
         return True
     if value.lower() == "false":
         return False
+    if value == "null":
+        return None
 
-    # JSON objects and arrays
-    if value.startswith("{") or value.startswith("["):
+    # JSON objects, arrays, and quoted strings (so launcher round-trips survive)
+    if value.startswith(("{", "[", '"')):
         try:
             return json.loads(value)
         except json.JSONDecodeError:
@@ -395,92 +402,75 @@ class ExternalEvalSummary:
 
 
 def _get_isolated_vllm_python() -> str | None:
-    """Get the path to the isolated vLLM Python interpreter if available."""
+    """Get the configured isolated vLLM Python interpreter for this process."""
     import os
 
     vllm_python = os.environ.get("VLLM_PYTHON")
-    if not vllm_python:
-        default_vllm_venv = "/opt/vllm-venv/bin/python"
-        if os.path.exists(default_vllm_venv):
-            vllm_python = default_vllm_venv
-
     if vllm_python and os.path.exists(vllm_python):
         return vllm_python
     return None
 
 
-def _get_vllm_version() -> str | None:
-    """Get vLLM version from isolated venv or current environment."""
+def _get_package_version(package: str) -> str | None:
+    """Get a package version from the current Python environment."""
+    import importlib
+
+    try:
+        module = importlib.import_module(package)
+    except ImportError:
+        return None
+
+    version = getattr(module, "__version__", None)
+    return str(version) if version is not None else None
+
+
+def _get_package_version_from_python(python_path: str, package: str) -> str | None:
+    """Get a package version from a specific Python interpreter."""
     import subprocess
 
-    # First check current environment
     try:
-        import vllm
+        result = subprocess.run(
+            [python_path, "-c", f"import {package}; print({package}.__version__)"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
 
-        return vllm.__version__
-    except ImportError:
-        pass
+    if result.returncode != 0:
+        return None
 
-    # Check isolated venv
-    vllm_python = _get_isolated_vllm_python()
-    if vllm_python:
-        try:
-            result = subprocess.run(
-                [vllm_python, "-c", "import vllm; print(vllm.__version__)"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                version = result.stdout.strip()
-                return f"{version} (isolated)"
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
-    return None
+    version = result.stdout.strip()
+    return version or None
 
 
-def _get_transformers_version() -> str | None:
-    """Get transformers version from current environment or isolated venv."""
-    import subprocess
+def _format_transformers_runtime_rows(
+    main_version: str | None,
+    isolated_version: str | None,
+    vllm_python: str | None,
+) -> list[tuple[str, str]]:
+    """Format runtime summary rows for transformers."""
+    if not vllm_python:
+        version = main_version or isolated_version
+        if version:
+            return [("Transformers", version)]
+        return [("Transformers", "[dim]NOT INSTALLED[/dim]")]
 
-    # First check current environment
-    try:
-        import transformers
-
-        return transformers.__version__
-    except ImportError:
-        pass
-
-    # Check isolated venv as fallback
-    vllm_python = _get_isolated_vllm_python()
-    if vllm_python:
-        try:
-            result = subprocess.run(
-                [vllm_python, "-c", "import transformers; print(transformers.__version__)"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                version = result.stdout.strip()
-                return f"{version} (isolated)"
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
-    return None
+    rows = [("Transformers (main)", main_version or "[dim]NOT INSTALLED[/dim]")]
+    rows.append(("Transformers (vLLM)", isolated_version or "[dim]NOT INSTALLED[/dim]"))
+    return rows
 
 
 def print_runtime_environment() -> None:
     """Print runtime environment summary for debugging."""
-    import os
     import sys
 
     from rich.panel import Panel
     from rich.table import Table
 
     table = Table(show_header=False, box=None, padding=(0, 1))
-    table.add_column("Key", style="bold", width=16)
+    table.add_column("Key", style="bold", width=20)
     table.add_column("Value")
 
     table.add_row("Python", sys.version.split()[0])
@@ -499,22 +489,31 @@ def print_runtime_environment() -> None:
     except ImportError:
         table.add_row("PyTorch", "[dim]NOT INSTALLED[/dim]")
 
-    transformers_version = _get_transformers_version()
-    if transformers_version:
-        table.add_row("Transformers", transformers_version)
-    else:
-        table.add_row("Transformers", "[dim]NOT INSTALLED[/dim]")
+    vllm_python = _get_isolated_vllm_python()
+    main_transformers_version = _get_package_version("transformers")
+    isolated_transformers_version = (
+        _get_package_version_from_python(vllm_python, "transformers") if vllm_python else None
+    )
+    for key, value in _format_transformers_runtime_rows(
+        main_transformers_version,
+        isolated_transformers_version,
+        vllm_python,
+    ):
+        table.add_row(key, value)
 
-    vllm_version = _get_vllm_version()
-    if vllm_version:
-        table.add_row("vLLM", vllm_version)
-    else:
-        table.add_row("vLLM", "[dim]NOT INSTALLED[/dim]")
-
-    # Show VLLM_PYTHON if set
-    vllm_python = os.environ.get("VLLM_PYTHON")
     if vllm_python:
-        table.add_row("VLLM_PYTHON", vllm_python)
+        vllm_version = _get_package_version_from_python(vllm_python, "vllm")
+        if vllm_version:
+            table.add_row("vLLM", f"{vllm_version} (isolated)")
+        else:
+            table.add_row("vLLM", "[dim]NOT INSTALLED[/dim]")
+        table.add_row("vLLM Python", vllm_python)
+    else:
+        vllm_version = _get_package_version("vllm")
+        if vllm_version:
+            table.add_row("vLLM", vllm_version)
+        else:
+            table.add_row("vLLM", "[dim]NOT INSTALLED[/dim]")
 
     console.print()
     console.print(Panel(table, title="Runtime Environment", border_style="blue"))

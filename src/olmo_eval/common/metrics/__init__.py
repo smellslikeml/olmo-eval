@@ -21,11 +21,8 @@ from .base import (
     ToolAccuracyMetric,
 )
 
-BPBMetric = BPBMetricInstanceAvg
-
 __all__ = [
     "AccuracyMetric",
-    "BPBMetric",
     "BPBMetricByteAvg",
     "BPBMetricInstanceAvg",
     "CorpusPerplexityMetric",

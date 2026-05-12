@@ -5,14 +5,14 @@ from typing import Any
 
 from olmo_eval.common.formatters import MultipleChoiceFormatter, PPLFormatter
 from olmo_eval.common.metrics import (
-    BPBMetric,
+    BPBMetricInstanceAvg,
     LogprobMCAccuracyMetric,
     LogprobPerCharMCAccuracyMetric,
     LogprobUncondMCAccuracyMetric,
 )
 from olmo_eval.common.types import Instance, LMRequest, RequestType, SamplingParams, Split
 from olmo_eval.data import DataSource
-from olmo_eval.evals.tasks.common import Task, register, register_regime, register_variant
+from olmo_eval.evals.tasks.common import Task, register, register_variant
 from olmo_eval.evals.tasks.common.format_helpers import format_mc as _format_mc
 from olmo_eval.evals.tasks.common.format_helpers import format_rc as _format_rc
 from olmo_eval.evals.tasks.constants.arc import (
@@ -120,7 +120,7 @@ class _ARCBase(Task):
         return any(isinstance(m, LogprobUncondMCAccuracyMetric) for m in self.config.metrics)
 
     def _is_bpb(self) -> bool:
-        return any(isinstance(m, BPBMetric) for m in self.config.metrics)
+        return any(isinstance(m, BPBMetricInstanceAvg) for m in self.config.metrics)
 
     def _format_bpb_request(self, instance: Instance) -> LMRequest:
         fewshot = self.get_fewshot()
@@ -211,49 +211,42 @@ class ARCChallenge(_ARCBase):
     _dataset_name = "arc_challenge"
 
 
-register_variant("arc_easy", "rc")
+register_variant("arc_easy", "rc", metrics=(LogprobPerCharMCAccuracyMetric(),))
 register_variant("arc_easy", "mc", formatter=MultipleChoiceFormatter())
-register_variant("arc_easy", "bpb", formatter=PPLFormatter(), metrics=(BPBMetric(),))
+register_variant("arc_easy", "bpb", formatter=PPLFormatter(), metrics=(BPBMetricInstanceAvg(),))
 register_variant(
     "arc_easy",
     "olmo3base",
     num_fewshot=5,
     fewshot_source="olmes_arc_easy_fixed",
-    split=Split.ALL,
+    split=Split.TEST,
     metrics=(LogprobPerCharMCAccuracyMetric(),),
-)
-register_regime(
-    "arc_easy",
-    "olmo3base",
-    num_fewshot=5,
-    fewshot_source="olmes_arc_easy_fixed",
-    split=Split.ALL,
 )
 register_variant("arc_easy", "olmes", num_fewshot=5, fewshot_source="olmes_arc_easy_fixed")
 register_variant("arc_easy", "full")
 
-register_variant("arc_challenge", "rc")
+register_variant("arc_challenge", "rc", metrics=(LogprobUncondMCAccuracyMetric(),))
 register_variant("arc_challenge", "mc", formatter=MultipleChoiceFormatter())
-register_variant("arc_challenge", "bpb", formatter=PPLFormatter(), metrics=(BPBMetric(),))
+register_variant(
+    "arc_challenge", "bpb", formatter=PPLFormatter(), metrics=(BPBMetricInstanceAvg(),)
+)
 register_variant(
     "arc_challenge",
     "olmo3base",
     num_fewshot=5,
     fewshot_source="olmes_arc_challenge_fixed",
-    split=Split.ALL,
+    split=Split.TEST,
     metrics=(LogprobUncondMCAccuracyMetric(),),
 )
-register_regime(
+register_variant(
     "arc_challenge",
-    "olmo3base",
+    "mc_olmo3base",
+    formatter=MultipleChoiceFormatter(),
     num_fewshot=5,
     fewshot_source="olmes_arc_challenge_fixed",
     split=Split.ALL,
 )
 register_variant(
-    "arc_challenge",
-    "olmes",
-    num_fewshot=5,
-    fewshot_source="olmes_arc_challenge_fixed",
+    "arc_challenge", "olmes", num_fewshot=5, fewshot_source="olmes_arc_challenge_fixed"
 )
 register_variant("arc_challenge", "full")

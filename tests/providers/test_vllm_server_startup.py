@@ -128,3 +128,70 @@ class TestVLLMServerStartupTimeout:
 
             url = server.start()
             assert url in ("http://localhost:8000/v1", "http://127.0.0.1:8000/v1")
+
+    @pytest.mark.anyio
+    async def test_vllm_python_selects_interpreter_but_not_child_env(self):
+        """VLLM_PYTHON should steer our launcher without leaking into vLLM."""
+        from olmo_eval.inference.providers.vllm_server_utils import VLLMServerProcess
+
+        mock_process = MagicMock()
+        mock_process.pid = 12345
+        mock_process.poll.return_value = None
+
+        with (
+            patch.dict("os.environ", {"VLLM_PYTHON": "/opt/vllm-venv/bin/python"}),
+            patch("subprocess.Popen", return_value=mock_process) as mock_popen,
+            patch(
+                "olmo_eval.inference.providers.vllm_server_utils._wait_for_server",
+                return_value=(True, None, None),
+            ),
+            patch("atexit.register"),
+        ):
+            server = VLLMServerProcess(
+                model_name="test-model",
+                port=8000,
+            )
+
+            server.start()
+
+        cmd = mock_popen.call_args.args[0]
+        env = mock_popen.call_args.kwargs["env"]
+        assert cmd[0] == "/opt/vllm-venv/bin/python"
+        assert "VLLM_PYTHON" not in env
+
+
+class TestVLLMServerProviderStartup:
+    """Tests for provider-side startup kwargs handling."""
+
+    def test_provider_local_runtime_flags_do_not_leak_to_server_kwargs(self):
+        """Provider-local runtime flags should not be forwarded as server CLI args."""
+        from olmo_eval.inference.providers.vllm_server import VLLMServerProvider
+
+        mock_server = MagicMock()
+        mock_server.base_url = "http://127.0.0.1:8000/v1"
+
+        with (
+            patch(
+                "olmo_eval.inference.providers.vllm_server_utils.VLLMServerProcess",
+                return_value=mock_server,
+            ) as mock_server_cls,
+            patch("olmo_eval.inference.providers.vllm_server.BeakerStatusReporter"),
+        ):
+            provider = VLLMServerProvider(
+                "test-model",
+                enforce_eager=True,
+                add_bos_token=False,
+                prompt_logprobs=1,
+                completion_use_prompt_token_ids=True,
+                completion_client_side_stop_trim=True,
+                completion_sentencepiece_cleanup=True,
+            )
+
+        assert provider.base_url == "http://127.0.0.1:8000/v1"
+        server_kwargs = mock_server_cls.call_args.kwargs
+        assert server_kwargs["enforce_eager"] is True
+        assert "add_bos_token" not in server_kwargs
+        assert "prompt_logprobs" not in server_kwargs
+        assert "completion_use_prompt_token_ids" not in server_kwargs
+        assert "completion_client_side_stop_trim" not in server_kwargs
+        assert "completion_sentencepiece_cleanup" not in server_kwargs

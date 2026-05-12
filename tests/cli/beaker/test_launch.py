@@ -193,6 +193,39 @@ class TestHarnessOverridesProviderDependencies:
         assert job_config.provider_packages is not None
         assert "https://github.com/user/vllm@custom" in job_config.provider_packages
 
+    def test_apply_harness_overrides_with_global_sandbox_override(self):
+        """Test that sandboxes={...} sets the shared pool and common sandbox fields."""
+        from olmo_eval.cli.beaker.launch import _apply_harness_overrides
+        from olmo_eval.harness import get_harness_preset
+        from olmo_eval.harness.sandbox import SandboxMode
+
+        preset = get_harness_preset("codex_universal")
+
+        result = _apply_harness_overrides(
+            preset,
+            [
+                'sandboxes={"mode":"modal","instances":64,"min_instances":24,'
+                '"registry_auth":{"provider":"gcp"}}'
+            ],
+        )
+
+        assert result.sandbox_pool_instances == 64
+        assert result.sandbox_pool_min_instances == 24
+        assert all(sandbox.mode == SandboxMode.MODAL for sandbox in result.sandboxes)
+        assert all(sandbox.registry_auth is not None for sandbox in result.sandboxes)
+        assert all(sandbox.registry_auth.provider == "gcp" for sandbox in result.sandboxes)
+
+    def test_get_task_configs_applies_sandbox_allocation_weight_override(self):
+        """Beaker task config preview should carry scheduler-only weight overrides."""
+        from olmo_eval.cli.beaker.launch import _get_task_configs
+
+        task_configs = _get_task_configs(
+            ["bigcodebench:olmo3base"],
+            {"bigcodebench:olmo3base": ["sandbox_allocation_weight=6.0"]},
+        )
+
+        assert task_configs["bigcodebench:olmo3base"].sandbox_allocation_weight == 6.0
+
 
 class TestTaskExpansionInExperimentSummary:
     """Tests for task expansion in _build_experiment_summary."""
@@ -201,12 +234,12 @@ class TestTaskExpansionInExperimentSummary:
         """Test that expanded tasks are used to lookup task configs."""
         from olmo_eval.common.configs import expand_tasks
 
-        # Verify that minerva_math_olmo3 expands to multiple tasks
-        expanded = expand_tasks(["minerva_math_olmo3"])
+        # Verify that minerva_math:olmo3base expands to multiple tasks
+        expanded = expand_tasks(["minerva_math:olmo3base"])
         assert len(expanded) > 1
 
         # The expanded tasks should have different names than the input
-        assert "minerva_math_olmo3" not in expanded
+        assert "minerva_math:olmo3base" not in expanded
         # But should contain minerva_math variants
         assert any("minerva_math" in t for t in expanded)
 
@@ -223,8 +256,8 @@ class TestTaskExpansionInExperimentSummary:
             name="test",
             model_spec="allenai/test-model",
             priority="normal",
-            tasks=["minerva_math_olmo3"],  # Unexpanded suite name
-            original_task_specs=["minerva_math_olmo3"],
+            tasks=["minerva_math:olmo3base"],  # Unexpanded suite name
+            original_task_specs=["minerva_math:olmo3base"],
             total_expanded_tasks=7,
             num_gpus=1,
         )
@@ -233,7 +266,7 @@ class TestTaskExpansionInExperimentSummary:
         mock_job_config = MagicMock()
 
         # Get the actual expanded task names
-        expanded = expand_tasks(["minerva_math_olmo3"])
+        expanded = expand_tasks(["minerva_math:olmo3base"])
 
         # Create task_configs_by_spec keyed by EXPANDED task names
         # (This simulates how _get_task_configs works)
@@ -246,7 +279,7 @@ class TestTaskExpansionInExperimentSummary:
         # Patch the harness and provider lookups that happen inside the function
         with patch("olmo_eval.harness.get_harness_preset") as mock_harness:
             mock_harness_config = MagicMock()
-            mock_harness_config.backend = None
+            mock_harness_config.scaffold = None
             mock_harness_config.sandboxes = ()
             mock_harness_config.merge_provider = MagicMock(return_value=mock_harness_config)
             mock_harness.return_value = mock_harness_config
@@ -269,7 +302,7 @@ class TestTaskExpansionInExperimentSummary:
         from olmo_eval.common.configs import expand_tasks
 
         # The suite name
-        suite_spec = "minerva_math_olmo3"
+        suite_spec = "minerva_math:olmo3base"
 
         # The expanded tasks have different names
         expanded = expand_tasks([suite_spec])

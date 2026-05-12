@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from olmo_eval.common.types import LMOutput, LMRequest, SamplingParams
+from olmo_eval.common.types import LMOutput, LMRequest, RequestType, SamplingParams
 from olmo_eval.inference.base import InferenceProvider
 from olmo_eval.inference.tokenizer_utils import encode_context_and_continuation
 
@@ -27,6 +27,21 @@ def _get_device() -> torch.device:
 class HuggingFaceProvider(InferenceProvider):
     """Provider using Hugging Face Transformers for local inference."""
 
+    # kwargs that may be passed by the runner but are not valid for HF from_pretrained
+    _IGNORED_KWARGS = frozenset(
+        {
+            "tensor_parallel_size",
+            "gpu_memory_utilization",
+            "attention_backend",
+            "use_tqdm_on_load",
+            "add_bos_token",
+            "max_model_len",
+            "load_format",
+            "model_loader_extra_config",
+            "enable_auto_tool_choice",
+        }
+    )
+
     def __init__(self, model_name: str, tokenizer: str | None = None, **model_kwargs) -> None:
         """Initialize the provider.
 
@@ -43,10 +58,14 @@ class HuggingFaceProvider(InferenceProvider):
                 "Install with: pip install transformers"
             ) from e
 
+        # Strip kwargs meant for other providers (e.g., vLLM)
+        for key in self._IGNORED_KWARGS:
+            model_kwargs.pop(key, None)
+
         super().__init__(model_name)
         tokenizer_path = tokenizer or model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        self.tokenizer: Any = AutoTokenizer.from_pretrained(tokenizer_path)
+        self.model: Any = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
         self.device = _get_device()
         self.model.to(self.device)
         self.model.eval()
@@ -154,9 +173,30 @@ class HuggingFaceProvider(InferenceProvider):
 
         return results
 
+    def describe_request(
+        self,
+        request: LMRequest,
+        sampling_params: SamplingParams | None = None,
+    ) -> dict[str, Any] | None:
+        params = self._default_sampling_params(sampling_params)
+        trace = super().describe_request(request, sampling_params)
+        if trace is None:
+            return None
+
+        if request.request_type != RequestType.LOGLIKELIHOOD:
+            trace["provider"] = "HuggingFaceProvider"
+            trace["endpoint"] = "transformers.generate"
+            trace["generation_kwargs"] = {
+                "max_gen_toks": params.max_tokens,
+                **self._build_generate_kwargs(params),
+            }
+            trace["stop_sequences"] = list(params.stop_sequences or ())
+        return trace
+
     def logprobs(
         self,
         requests: list[LMRequest],
+        sampling_params: SamplingParams | None = None,
     ) -> list[list[LMOutput]]:
         import torch
 
@@ -183,8 +223,8 @@ class HuggingFaceProvider(InferenceProvider):
 
                 logprob_entries = []
                 total = 0.0
-                for i, tok in enumerate(continuation_enc):
-                    lp = log_probs[ctx_len + i - 1, tok].item()
+                for j, tok in enumerate(continuation_enc):
+                    lp = log_probs[ctx_len + j - 1, tok].item()
                     token_str = self.tokenizer.decode(tok, skip_special_tokens=False)
                     logprob_entries.append(
                         {
@@ -228,6 +268,7 @@ class HuggingFaceProvider(InferenceProvider):
     async def alogprobs(
         self,
         requests: list[LMRequest],
+        sampling_params: SamplingParams | None = None,
     ) -> list[list[LMOutput]]:
         """Async compute logprobs for continuations.
 
@@ -239,4 +280,4 @@ class HuggingFaceProvider(InferenceProvider):
         Returns:
             List of output lists with logprobs populated.
         """
-        return await asyncio.to_thread(self.logprobs, requests)
+        return await asyncio.to_thread(self.logprobs, requests, sampling_params)

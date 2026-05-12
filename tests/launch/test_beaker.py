@@ -246,10 +246,10 @@ class TestParseTaskWithPriority:
         assert task == "mmlu"
         assert priority == "high"
 
-    def test_task_with_regime_and_priority(self):
-        """Test task with regime and priority."""
-        task, priority = parse_task_with_priority("mmlu:olmes@high")
-        assert task == "mmlu:olmes"
+    def test_task_with_variant_and_priority(self):
+        """Test task with a variant and priority."""
+        task, priority = parse_task_with_priority("arc_easy:mc@high")
+        assert task == "arc_easy:mc"
         assert priority == "high"
 
     def test_custom_default_priority(self):
@@ -322,8 +322,8 @@ class TestValidatePriorityConfiguration:
 
     def test_task_with_variant_and_priority(self):
         """Test task with variant (:) and @priority suffix."""
-        result = validate_priority_configuration(["mmlu:olmes@high"])
-        assert result == {"high": ["mmlu:olmes"]}
+        result = validate_priority_configuration(["arc_easy:mc@high"])
+        assert result == {"high": ["arc_easy:mc"]}
 
 
 class TestCalculateExperimentSplits:
@@ -574,6 +574,76 @@ class TestBuildCommandWithTaskPackages:
         # GitHub URL should get git+ prefix
         assert "uv pip install 'git+https://github.com/user/repo@v1.0'" in install_cmd
 
+    def test_provider_packages_use_isolated_vllm_venv(self):
+        """Provider packages should install into the isolated vLLM venv."""
+        from olmo_eval.launch import BeakerLauncher
+
+        launcher = BeakerLauncher()
+        install_cmd = launcher._build_install_cmd(
+            extras=["vllm", "clients"],
+            env_exports=None,
+            provider_packages=["git+https://github.com/user/repo@v1.0"],
+            vllm_isolated_venv=True,
+        )
+
+        assert (
+            "uv --no-config --no-cache pip install --python /opt/vllm-venv/bin/python "
+            "--refresh --refresh-package repo --reinstall-package repo "
+            "'repo @ git+https://github.com/user/repo@v1.0' -c /tmp/cuda-constraints.txt"
+        ) in install_cmd
+        assert "[isolated-vllm-check]" not in install_cmd
+
+    def test_task_packages_stay_in_main_env_with_isolated_vllm(self):
+        """Task packages should continue installing in the main app environment."""
+        from olmo_eval.launch import BeakerLauncher
+
+        launcher = BeakerLauncher()
+        install_cmd = launcher._build_install_cmd(
+            extras=["vllm", "clients"],
+            env_exports=None,
+            provider_packages=["provider-dep==1.0"],
+            task_packages=["task-dep==1.0"],
+            vllm_isolated_venv=True,
+        )
+
+        assert (
+            "uv pip install --python /opt/vllm-venv/bin/python "
+            "--refresh-package provider-dep --reinstall-package provider-dep "
+            "'provider-dep==1.0' -c /tmp/cuda-constraints.txt"
+        ) in install_cmd
+        assert "uv pip install 'task-dep==1.0' -c /tmp/cuda-constraints.txt" in install_cmd
+        assert (
+            "uv pip install --python /opt/vllm-venv/bin/python "
+            "'task-dep==1.0' -c /tmp/cuda-constraints.txt"
+        ) not in install_cmd
+        assert "[isolated-vllm-check]" not in install_cmd
+
+    def test_provider_packages_can_enable_isolated_vllm_venv_without_vllm_extra(self):
+        """A custom provider package should still use the isolated vLLM venv."""
+        from olmo_eval.launch import BeakerLauncher
+
+        launcher = BeakerLauncher()
+        install_cmd = launcher._build_install_cmd(
+            extras=["clients"],
+            env_exports=None,
+            provider_packages=["https://github.com/user/vllm@custom"],
+            vllm_isolated_venv=True,
+        )
+
+        assert "uv venv /opt/vllm-venv" in install_cmd
+        assert "export VLLM_PYTHON=/opt/vllm-venv/bin/python" in install_cmd
+        assert (
+            "cd /gantry-runtime && uv pip install "
+            "--python /opt/vllm-venv/bin/python "
+            "--cache-dir \"$UV_CACHE_DIR\" -e '.[vllm]'"
+        ) not in install_cmd
+        assert (
+            "uv --no-config --no-cache pip install --python /opt/vllm-venv/bin/python "
+            "--refresh --refresh-package vllm --reinstall-package vllm "
+            "'vllm @ git+https://github.com/user/vllm@custom' -c /tmp/cuda-constraints.txt"
+        ) in install_cmd
+        assert "[isolated-vllm-check]" not in install_cmd
+
 
 class TestNormalizeProviderPackage:
     """Tests for normalize_provider_package function."""
@@ -597,6 +667,13 @@ class TestNormalizeProviderPackage:
         """Test git+ URL passes through unchanged."""
         result = normalize_provider_package("git+https://github.com/user/vllm@v0.14.0")
         assert result == "git+https://github.com/user/vllm@v0.14.0"
+
+    def test_named_direct_reference_preserved(self):
+        """Named direct references should keep the package name and normalize the source."""
+        result = normalize_provider_package(
+            "transformers @ https://github.com/user/transformers@main"
+        )
+        assert result == "transformers @ git+https://github.com/user/transformers@main"
 
     def test_pypi_version_unchanged(self):
         """Test PyPI version spec passes through unchanged."""
@@ -692,6 +769,57 @@ class TestBuildInstallCommand:
         """Test without constraints file."""
         cmd = build_install_command("vllm==0.14.0", None)
         assert cmd == "uv pip install 'vllm==0.14.0'"
+
+    def test_virtualenv_target(self):
+        """Test targeting a specific virtualenv via --python."""
+        cmd = build_install_command("vllm==0.14.0", "/tmp/constraints.txt", "/opt/vllm-venv")
+        assert (
+            cmd == "uv pip install --python /opt/vllm-venv/bin/python 'vllm==0.14.0' "
+            "-c /tmp/constraints.txt"
+        )
+
+    def test_force_reinstall_targets_named_package(self):
+        """Forced installs should target the overridden package by name."""
+        cmd = build_install_command(
+            "transformers==5.8.0",
+            "/tmp/constraints.txt",
+            "/opt/vllm-venv",
+            force_reinstall=True,
+        )
+        assert (
+            cmd == "uv pip install --python /opt/vllm-venv/bin/python "
+            "--refresh-package transformers --reinstall-package transformers "
+            "'transformers==5.8.0' -c /tmp/constraints.txt"
+        )
+
+    def test_force_reinstall_targets_git_repo_name(self):
+        """Forced git installs should infer the distribution name from the repo."""
+        cmd = build_install_command(
+            "git+https://github.com/user/transformers.git@custom-branch",
+            "/tmp/constraints.txt",
+            "/opt/vllm-venv",
+            force_reinstall=True,
+        )
+        assert (
+            cmd == "uv --no-config --no-cache pip install --python /opt/vllm-venv/bin/python "
+            "--refresh --refresh-package transformers --reinstall-package transformers "
+            "'transformers @ git+https://github.com/user/transformers.git@custom-branch' "
+            "-c /tmp/constraints.txt"
+        )
+
+    def test_force_reinstall_respects_existing_reinstall_flags(self):
+        """Explicit reinstall flags should not be duplicated."""
+        cmd = build_install_command(
+            "transformers==5.8.0 --reinstall-package transformers",
+            "/tmp/cuda-constraints.txt",
+            "/opt/vllm-venv",
+            force_reinstall=True,
+        )
+        assert (
+            cmd == "uv pip install --python /opt/vllm-venv/bin/python "
+            "--reinstall-package transformers "
+            "'transformers==5.8.0' -c /tmp/cuda-constraints.txt"
+        )
 
 
 class TestDetectGpuRequirement:
@@ -806,3 +934,41 @@ class TestDetectGpuRequirement:
 
         # 2 instances × 1 TP (main) + 0 (external server) = 2 GPUs
         assert gpus == 2
+
+
+class TestLaunchConfigLoaderExperimentNames:
+    """Tests for auto-generated Beaker experiment names."""
+
+    def test_generated_name_strips_task_priority_suffixes(self):
+        loader = LaunchConfigLoader(
+            config_path=None,
+            cli_args={
+                "model": ("XiaomiMiMo/MiMo-7B-Base", "nvidia/NVIDIA-Nemotron-Nano-9B-v2"),
+                "task": ("olmobase:code@urgent", "olmobase:code_fim@urgent"),
+                "cluster": "h100",
+                "workspace": "ai2/test-workspace",
+                "budget": "ai2/test-budget",
+                "gpus": 0,
+            },
+        )
+
+        config = loader.load()
+
+        assert config.name == "olmobase_code-olmobase_code_fim"
+
+    def test_generated_name_strips_priority_for_many_tasks(self):
+        loader = LaunchConfigLoader(
+            config_path=None,
+            cli_args={
+                "model": ("XiaomiMiMo/MiMo-7B-Base",),
+                "task": ("olmobase:code@urgent", "olmobase:code_fim@urgent", "olmobase:math@high"),
+                "cluster": "h100",
+                "workspace": "ai2/test-workspace",
+                "budget": "ai2/test-budget",
+                "gpus": 0,
+            },
+        )
+
+        config = loader.load()
+
+        assert config.name == "mimo-7b-base-olmobase_code-and-2-more"

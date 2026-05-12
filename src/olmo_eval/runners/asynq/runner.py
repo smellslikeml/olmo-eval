@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import multiprocessing as mp
 import random
 import time
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 
@@ -19,25 +21,287 @@ from olmo_eval.harness.config import HarnessConfig, ProviderConfig
 from olmo_eval.runners.asynq.monitoring import (
     terminate_workers,
     wait_for_init_times,
-    wait_for_scorer_ready,
     wait_for_workers_ready,
 )
-from olmo_eval.runners.asynq.preparation import (
-    build_requests_from_items,
-    prepare_task_items,
-)
+from olmo_eval.runners.asynq.preparation import prepare_task_items
 from olmo_eval.runners.asynq.results import aggregate_results, process_results
 from olmo_eval.runners.asynq.types import QueueItem, TaskTracker
-from olmo_eval.runners.asynq.workers import scoring_worker
 from olmo_eval.runners.common.base import BaseEvalRunner
 from olmo_eval.runners.common.mixins import RunnerResultsMixin
 from olmo_eval.runners.common.models import S3Config
-from olmo_eval.runners.processing.utils import compute_task_hash, generate_experiment_id
+from olmo_eval.runners.processing.utils import generate_experiment_id
 from olmo_eval.storage import StorageBackend
+
+if TYPE_CHECKING:
+    from olmo_eval.evals.tasks.common import SandboxEnv, Task
+    from olmo_eval.harness.sandbox import SandboxConfig
 
 logger = get_logger(__name__)
 runner_logger = configure_worker_logging("runner")
 console = Console(force_terminal=True, width=120)
+
+_DEFAULT_SANDBOX_ENV = "__default__"
+
+
+@dataclass(frozen=True)
+class _SandboxDemand:
+    """Execution-aware sandbox demand summary for allocation and logging."""
+
+    sandbox_envs: list[SandboxEnv]
+    env_sandbox_items: dict[str, int]
+    env_work_units: dict[str, float]
+    env_task_count: dict[str, int]
+    needs_default: bool
+
+
+@dataclass(frozen=True)
+class _SandboxPlan:
+    """Resolved sandbox configs and allocation data for relevant sandbox envs."""
+
+    sandboxes: list[SandboxConfig]
+    env_sandbox_items: dict[str, int]
+    env_work_units: dict[str, float]
+    env_task_count: dict[str, int]
+    allocated: dict[str, int]
+    min_required: dict[str, int]
+    budget: int
+    needs_default: bool
+
+
+def _materialize_sandbox_instances(sandboxes: Sequence[SandboxConfig]) -> list[SandboxConfig]:
+    """Replace auto-managed sandbox instance counts with their runtime defaults."""
+    return [
+        replace(cfg, instances=cfg.resolved_instances) if cfg.instances is None else cfg
+        for cfg in sandboxes
+    ]
+
+
+def _count_execution_scorers(task: Task) -> int:
+    """Count unique execution scorers after task-level deduplication."""
+    from olmo_eval.common.scorers.execution import ExecutionScorer
+
+    return sum(1 for scorer in task._get_scorers().values() if isinstance(scorer, ExecutionScorer))
+
+
+def _collect_sandbox_demand(
+    trackers: Mapping[str, TaskTracker],
+    expanded_tasks: Sequence[str] | None = None,
+) -> _SandboxDemand:
+    """Collect execution-aware sandbox demand and task counts per environment."""
+    env_sandbox_items: dict[str, int] = {}
+    env_work_units: dict[str, float] = {}
+    env_task_count: dict[str, int] = {}
+    named_envs: dict[str, SandboxEnv] = {}
+    needs_default = False
+    relevant_specs = set(expanded_tasks) if expanded_tasks else None
+
+    for spec, tracker in trackers.items():
+        if relevant_specs is not None and spec not in relevant_specs:
+            continue
+        if tracker.task is None:
+            continue
+        execution_scorer_count = _count_execution_scorers(tracker.task)
+        if execution_scorer_count <= 0:
+            continue
+
+        tcfg = tracker.task.config
+        num_samples = tcfg.sampling_params.num_samples if tcfg.sampling_params else 1
+        sandbox_items = tracker.total_instances * num_samples * execution_scorer_count
+
+        if tcfg.sandbox_env is None:
+            env_key = _DEFAULT_SANDBOX_ENV
+            needs_default = True
+        else:
+            senv = tcfg.sandbox_env
+            if senv.name in named_envs and named_envs[senv.name] != senv:
+                raise ValueError(
+                    f"Conflicting sandbox_env for '{senv.name}': "
+                    f"{named_envs[senv.name].dependencies} vs {senv.dependencies}"
+                )
+            named_envs[senv.name] = senv
+            env_key = senv.name
+
+        env_sandbox_items[env_key] = env_sandbox_items.get(env_key, 0) + sandbox_items
+        env_work_units[env_key] = env_work_units.get(env_key, 0.0) + (
+            sandbox_items * tcfg.sandbox_allocation_weight
+        )
+        env_task_count[env_key] = env_task_count.get(env_key, 0) + 1
+
+    return _SandboxDemand(
+        sandbox_envs=list(named_envs.values()),
+        env_sandbox_items=env_sandbox_items,
+        env_work_units=env_work_units,
+        env_task_count=env_task_count,
+        needs_default=needs_default,
+    )
+
+
+def _format_work_units(work_units: float) -> str:
+    """Format weighted sandbox work units for logs and tables."""
+    if float(work_units).is_integer():
+        return str(int(work_units))
+    return f"{work_units:.1f}"
+
+
+def _allocate_auto_sandbox_instances(
+    auto_env_keys: Sequence[str],
+    env_work_units: Mapping[str, float],
+    sandbox_pool_instances: int | None,
+) -> dict[str, int]:
+    """Allocate the shared sandbox pool across auto-managed environments."""
+    if not auto_env_keys:
+        return {}
+    if sandbox_pool_instances is None:
+        return {env_key: 1 for env_key in auto_env_keys}
+
+    budget = sandbox_pool_instances
+    min_budget = len(auto_env_keys)
+    if budget < min_budget:
+        logger.warning(
+            f"Sandbox pool budget ({budget}) is less than the number of "
+            f"auto-allocated environments ({min_budget}); clamping to {min_budget}"
+        )
+        budget = min_budget
+
+    total_demand = sum(env_work_units.get(env_key, 0.0) for env_key in auto_env_keys)
+    if total_demand <= 0:
+        base = budget // len(auto_env_keys)
+        remainder = budget % len(auto_env_keys)
+        allocated: dict[str, int] = {}
+        for i, env_key in enumerate(auto_env_keys):
+            allocated[env_key] = base + (1 if i < remainder else 0)
+        return allocated
+
+    distributable = budget - len(auto_env_keys)
+    allocated = {}
+    for env_key in auto_env_keys:
+        demand = env_work_units.get(env_key, 0.0)
+        extra = max(0, round(distributable * demand / total_demand))
+        allocated[env_key] = 1 + extra
+
+    diff = budget - sum(allocated.values())
+    if diff != 0:
+        top = max(auto_env_keys, key=lambda key: env_work_units.get(key, 0.0))
+        allocated[top] = max(1, allocated[top] + diff)
+    return allocated
+
+
+def _plan_sandbox_configs(
+    base_sandboxes: Sequence[SandboxConfig],
+    expanded_tasks: Sequence[str],
+    trackers: Mapping[str, TaskTracker],
+    sandbox_pool_instances: int | None,
+    sandbox_pool_min_instances: int | None = None,
+) -> _SandboxPlan | None:
+    """Resolve relevant sandbox configs and concrete executor counts."""
+    from olmo_eval.harness.sandbox.image import dependencies_to_dockerfile_extra
+
+    sandbox_demand = _collect_sandbox_demand(trackers, expanded_tasks)
+    sandbox_envs = sandbox_demand.sandbox_envs
+    needs_default = sandbox_demand.needs_default
+    if not sandbox_envs and not needs_default:
+        return None
+
+    template = base_sandboxes[0]
+    used_caps = {senv.capability for senv in sandbox_envs}
+    sandboxes = [
+        cfg
+        for i, cfg in enumerate(base_sandboxes)
+        if (i == 0 and needs_default) or (i != 0 and cfg.capabilities in used_caps)
+    ]
+
+    env_to_index: dict[str, int] = {}
+    if needs_default and sandboxes:
+        env_to_index[_DEFAULT_SANDBOX_ENV] = 0
+
+    for senv in sandbox_envs:
+        extra = dependencies_to_dockerfile_extra(senv.dependencies)
+        match_idx = next(
+            (i for i, cfg in enumerate(sandboxes) if cfg.capabilities == senv.capability),
+            None,
+        )
+        if match_idx is not None:
+            matched = sandboxes[match_idx]
+            sandboxes[match_idx] = replace(
+                matched,
+                dockerfile_extra=matched.dockerfile_extra + extra + senv.dockerfile_extra,
+            )
+            env_to_index[senv.name] = match_idx
+        else:
+            sandboxes.append(
+                replace(
+                    template,
+                    capabilities=senv.capability,
+                    dockerfile_extra=template.dockerfile_extra + extra + senv.dockerfile_extra,
+                    inject_swerex=True,
+                    instances=None,
+                )
+            )
+            env_to_index[senv.name] = len(sandboxes) - 1
+
+    explicit_allocations: dict[str, int] = {}
+    for env_key, idx in env_to_index.items():
+        instances = sandboxes[idx].instances
+        if instances is not None:
+            explicit_allocations[env_key] = instances
+    auto_env_keys = [env_key for env_key in env_to_index if env_key not in explicit_allocations]
+    if (
+        sandbox_pool_instances is None
+        and _DEFAULT_SANDBOX_ENV in explicit_allocations
+        and auto_env_keys
+    ):
+        auto_env_list = ", ".join(sorted(auto_env_keys))
+        logger.warning(
+            "Default sandbox has explicit instances=%s while sandbox envs [%s] are "
+            "auto-managed with no shared sandbox pool; those envs will default to one "
+            "executor each. Use sandbox_pool_instances or a global "
+            "'sandboxes={...,\"instances\":N}' override to distribute capacity across all "
+            "sandbox envs.",
+            explicit_allocations[_DEFAULT_SANDBOX_ENV],
+            auto_env_list,
+        )
+    auto_allocations = _allocate_auto_sandbox_instances(
+        auto_env_keys,
+        sandbox_demand.env_work_units,
+        sandbox_pool_instances,
+    )
+    auto_min_requirements = (
+        _allocate_auto_sandbox_instances(
+            auto_env_keys,
+            sandbox_demand.env_work_units,
+            sandbox_pool_min_instances,
+        )
+        if sandbox_pool_min_instances is not None
+        else {}
+    )
+    allocated: dict[str, int] = dict(explicit_allocations)
+    allocated.update(auto_allocations)
+
+    materialized_sandboxes = list(sandboxes)
+    min_required: dict[str, int] = {}
+    for env_key, idx in env_to_index.items():
+        original = materialized_sandboxes[idx]
+        resolved_instances = allocated[env_key]
+        resolved_min = auto_min_requirements.get(env_key, original.min_instances)
+        if resolved_min is not None:
+            resolved_min = min(resolved_min, resolved_instances)
+        min_required[env_key] = resolved_min if resolved_min is not None else resolved_instances
+        materialized_sandboxes[idx] = replace(
+            original,
+            instances=resolved_instances,
+            min_instances=resolved_min,
+        )
+
+    return _SandboxPlan(
+        sandboxes=materialized_sandboxes,
+        env_sandbox_items=sandbox_demand.env_sandbox_items,
+        env_work_units=sandbox_demand.env_work_units,
+        env_task_count=sandbox_demand.env_task_count,
+        allocated=allocated,
+        min_required=min_required,
+        budget=sum(allocated.values()),
+        needs_default=needs_default,
+    )
 
 
 @dataclass
@@ -159,13 +423,11 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
         ctx = mp.get_context("spawn")
         item_queue: mp.Queue = ctx.Queue()
         result_queue: mp.Queue = ctx.Queue()
-        scoring_queue: mp.Queue = ctx.Queue()
-        scored_queue: mp.Queue = ctx.Queue()
         total_gpus = self._get_gpu_count()
 
-        # Create shared dict for tracking worker init times
-        manager = ctx.Manager()
-        init_times = manager.dict()
+        # Queue for workers to report init times (replaces mp.Manager dict to
+        # avoid a long-lived server process that can zombie and hang on shutdown)
+        init_queue: mp.Queue = ctx.Queue()
 
         # Shuffle with seed for deterministic ordering (enables future checkpointing)
         rng = random.Random(self.shuffle_seed)
@@ -175,7 +437,7 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
 
         # Start workers
         workers: list[mp.process.BaseProcess] = []
-        scorer_proc: mp.process.BaseProcess | None = None
+        sandbox_manager = None
         inference_manager = None
 
         try:
@@ -213,7 +475,7 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
             provider_manager.add_poison_pills()
 
             # Start workers
-            workers = provider_manager.start(ctx, total_instances, init_times)
+            workers = provider_manager.start(ctx, total_instances, init_queue)
 
             # Start auxiliary inference servers if configured
             registry_config: dict[str, list[dict[str, Any]]] | None = None
@@ -235,17 +497,101 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
             # Prepare sandbox configs for scoring worker if configured
             sandbox_configs_list = None
             if self.harness_config.sandboxes:
-                sandbox_configs_list = [s.to_dict() for s in self.harness_config.sandboxes]
+                sandboxes = list(self.harness_config.sandboxes)
 
-            # Create ready event for scoring worker
-            scorer_ready = ctx.Event()
+                sandbox_plan = _plan_sandbox_configs(
+                    self.harness_config.sandboxes,
+                    expanded_tasks,
+                    trackers,
+                    self.harness_config.sandbox_pool_instances,
+                    self.harness_config.sandbox_pool_min_instances,
+                )
+                if sandbox_plan is not None:
+                    sandboxes = sandbox_plan.sandboxes
+
+                    for env_key in sorted(sandbox_plan.env_work_units):
+                        display_name = "default" if env_key == _DEFAULT_SANDBOX_ENV else env_key
+                        work_units = _format_work_units(
+                            sandbox_plan.env_work_units.get(env_key, 0.0)
+                        )
+                        runner_logger.info(
+                            f"Sandbox env '{display_name}' "
+                            f"({sandbox_plan.allocated.get(env_key, 1)} executors, "
+                            f"{sandbox_plan.env_sandbox_items.get(env_key, 0)} sandbox items, "
+                            f"{work_units} work units)"
+                        )
+
+                    # Print sandbox distribution summary
+                    from rich.table import Table
+
+                    dist_table = Table(title="Sandbox Distribution")
+                    dist_table.add_column("Env", style="cyan")
+                    dist_table.add_column("Tasks", justify="right")
+                    dist_table.add_column("Sandbox Items", justify="right")
+                    dist_table.add_column("Work Units", justify="right")
+                    dist_table.add_column("Executors", justify="right")
+                    dist_table.add_column("Share", justify="right")
+
+                    for env_key in sorted(sandbox_plan.env_work_units):
+                        display_name = "default" if env_key == _DEFAULT_SANDBOX_ENV else env_key
+                        executors = sandbox_plan.allocated.get(env_key, 0)
+                        share = (
+                            f"{executors / sandbox_plan.budget * 100:.1f}%"
+                            if sandbox_plan.budget > 0
+                            else "0.0%"
+                        )
+                        dist_table.add_row(
+                            display_name,
+                            str(sandbox_plan.env_task_count.get(env_key, 0)),
+                            str(sandbox_plan.env_sandbox_items.get(env_key, 0)),
+                            _format_work_units(sandbox_plan.env_work_units.get(env_key, 0.0)),
+                            str(executors),
+                            share,
+                        )
+
+                    console.print(dist_table)
+                else:
+                    sandboxes = _materialize_sandbox_instances(sandboxes)
+
+                # Pre-build unique sandbox images in parallel to avoid
+                # duplicate builds when multiple executors share the same image
+                from concurrent.futures import ThreadPoolExecutor
+
+                from olmo_eval.harness.sandbox.image import get_swerex_image
+
+                # Dedupe by (image, dockerfile_extra) — configs sharing these produce the same image
+                unique_builds: dict[tuple[str, tuple[str, ...]], Any] = {}
+                for cfg in sandboxes:
+                    if cfg.inject_swerex:
+                        key = (cfg.image, cfg.dockerfile_extra)
+                        if key not in unique_builds:
+                            unique_builds[key] = cfg
+
+                if unique_builds:
+                    runner_logger.info(
+                        f"Pre-building {len(unique_builds)} unique sandbox image(s)..."
+                    )
+
+                    def _build(cfg: Any) -> None:
+                        require_registry = cfg.mode.value == "modal"
+                        get_swerex_image(
+                            cfg.image,
+                            cfg.container_runtime,
+                            cfg.dockerfile_extra,
+                            require_registry=require_registry,
+                        )
+
+                    with ThreadPoolExecutor(max_workers=len(unique_builds)) as pool:
+                        list(pool.map(_build, unique_builds.values()))
+
+                sandbox_configs_list = [s.to_dict() for s in sandboxes]
 
             # Determine scoring concurrency
             if self.harness_config.scoring_concurrency:
                 scoring_concurrency = self.harness_config.scoring_concurrency
             elif sandbox_configs_list is not None:
                 # Match sandbox pool size (sum of instances across all configs)
-                sandbox_pool_size = sum(cfg.get("instances", 1) for cfg in sandbox_configs_list)
+                sandbox_pool_size = sum((cfg.get("instances") or 1) for cfg in sandbox_configs_list)
                 scoring_concurrency = max(1, sandbox_pool_size)
             else:
                 # CPU-bound scoring - use available cores
@@ -256,49 +602,44 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
 
             runner_logger.info(f"Scoring concurrency: {scoring_concurrency}")
 
-            scorer_id = "scorer-0"  # TODO: support multiple scorers
-            scorer_proc = ctx.Process(
-                target=scoring_worker,
-                args=(
-                    scorer_id,
-                    scoring_queue,
-                    scored_queue,
-                    total_instances,
-                    sandbox_configs_list,
-                    scorer_ready,
-                    scoring_concurrency,
-                    registry_config,
-                ),
-            )
-            scorer_proc.start()
-
-            # Wait for workers to initialize
-            runner_logger.info("Waiting for inference workers to initialize...")
-            wait_for_workers_ready(workers, result_queue, startup_timeout=60.0)
-
-            # Now wait for scoring worker (runs in parallel with inference worker init)
+            # Initialize sandbox manager inline (no separate scorer process)
+            sandbox_manager = None
             if sandbox_configs_list is not None:
-                # Compute scorer startup timeout
-                if self.harness_config.scorer_startup_timeout is not None:
-                    scorer_timeout = self.harness_config.scorer_startup_timeout
-                else:
-                    # Derive from max sandbox startup_timeout + buffer
-                    max_startup = max(
-                        cfg.get("startup_timeout", 60.0) for cfg in sandbox_configs_list
-                    )
-                    scorer_timeout = max_startup + 60.0
+                from olmo_eval.harness.sandbox import SandboxConfig, SandboxManager
 
+                sandbox_configs = [SandboxConfig.from_dict(d) for d in sandbox_configs_list]
                 runner_logger.info(
-                    f"Waiting for scoring worker to initialize (timeout={scorer_timeout}s)..."
+                    f"Initializing sandbox manager with {len(sandbox_configs)} config(s)..."
                 )
-                wait_for_scorer_ready(
-                    scorer_proc, scorer_ready, scored_queue, timeout=scorer_timeout
-                )
-                runner_logger.info("Scoring worker ready")
+                sandbox_manager = SandboxManager(sandbox_configs, owner="scorer")
+                await sandbox_manager.start()
+                runner_logger.info("Sandbox manager ready")
+
+            # Create provider registry for auxiliary providers
+            provider_registry = None
+            if registry_config:
+                from olmo_eval.inference.registry import ProviderRegistry
+
+                provider_registry = ProviderRegistry.from_serialized(registry_config)
+                if provider_registry:
+                    runner_logger.info(
+                        f"Provider registry ready with providers: {provider_registry.names}"
+                    )
+
+            from olmo_eval.common.execution import ScoringContext
+
+            scoring_context = ScoringContext(
+                execution_env=sandbox_manager,
+                scoring_concurrency=scoring_concurrency,
+                inference_pool=provider_registry,
+            )
+
+            # Ensure inference workers are ready before dispatching
+            wait_for_workers_ready(workers, result_queue, startup_timeout=60.0)
 
             # Wait for workers to report their init times (also checks for crashes)
             provider_init_seconds = wait_for_init_times(
-                init_times, num_inference_workers, workers=workers, result_queue=result_queue
+                init_queue, num_inference_workers, workers=workers, result_queue=result_queue
             )
 
             # Reset tracker start times now that workers are ready
@@ -311,20 +652,12 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
             results = await self._process_results(
                 trackers,
                 result_queue,
-                scoring_queue,
-                scored_queue,
                 workers,
-                scorer_proc,
+                scoring_context,
+                scoring_concurrency,
                 len(expanded_tasks),
                 total_instances,
             )
-
-            # Signal scoring worker to shutdown and wait
-            scoring_queue.put(None)
-            scorer_proc.join(timeout=30)
-            if scorer_proc.is_alive():
-                scorer_proc.terminate()
-                scorer_proc.join()
 
             # Wait for all workers
             for worker in workers:
@@ -361,14 +694,14 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
             )
         finally:
             terminate_workers(workers)
-            if scorer_proc and scorer_proc.is_alive():
-                scorer_proc.terminate()
-                scorer_proc.join(timeout=5)
+            if sandbox_manager is not None:
+                runner_logger.info("Stopping sandbox manager...")
+                with contextlib.suppress(Exception):
+                    await sandbox_manager.stop()
             if inference_manager is not None:
                 inference_manager.shutdown()
-            for q in [item_queue, result_queue, scoring_queue, scored_queue]:
+            for q in [item_queue, result_queue, init_queue]:
                 q.cancel_join_thread()
-            manager.shutdown()
 
     def _prepare_tasks(
         self,
@@ -424,10 +757,6 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
         for spec in expanded_tasks:
             tracker, task_items = prepared_results[spec]
             items.extend(task_items)
-            if not tracker.error and self.save_requests and task_items and tracker.task:
-                request_objects = build_requests_from_items(task_items, tracker.task.config.name)
-                task_hash = compute_task_hash(tracker.task.config.to_dict())
-                self._write_requests(self.model_name, spec, request_objects, task_hash)
 
         # Print task preparation summary table
         table = Table(title="Tasks")
@@ -540,26 +869,26 @@ class AsyncEvalRunner(RunnerResultsMixin, BaseEvalRunner):
         self,
         trackers: dict[str, TaskTracker],
         result_queue: mp.Queue,
-        scoring_queue: mp.Queue,
-        scored_queue: mp.Queue,
         workers: list[mp.process.BaseProcess],
-        scorer_proc: mp.process.BaseProcess,
+        scoring_context: Any,
+        scoring_concurrency: int,
         total_tasks: int,
         total_instances: int,
     ) -> dict[str, Any]:
-        """Process results from workers with parallel instance-level scoring."""
+        """Process results from workers with inline async scoring."""
         return await process_results(
             trackers=trackers,
             result_queue=result_queue,
-            scoring_queue=scoring_queue,
-            scored_queue=scored_queue,
             workers=workers,
-            scorer_proc=scorer_proc,
+            scoring_context=scoring_context,
+            scoring_concurrency=scoring_concurrency,
             total_tasks=total_tasks,
             total_instances=total_instances,
             model_name=self.model_name,
             save_predictions=self.save_predictions,
             write_predictions_fn=self._write_predictions,
+            save_requests=self.save_requests,
+            write_requests_fn=self._write_requests,
         )
 
     def _aggregate_results(

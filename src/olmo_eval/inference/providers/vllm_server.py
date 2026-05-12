@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from olmo_eval.common.beaker_status import BeakerStatusReporter
 from olmo_eval.common.logging import get_logger
 from olmo_eval.common.types import LMOutput, LMRequest, LogProbEntry, RequestType, SamplingParams
 from olmo_eval.common.types.tools import ToolCall
@@ -108,6 +109,32 @@ class RemoteTokenizer:
             self._client = None
 
 
+class _TokenizerBosOverride:
+    """Tokenizer proxy that overrides add_bos_token without mutating the underlying tokenizer."""
+
+    def __init__(self, tokenizer: Any, add_bos_token: bool) -> None:
+        self._tokenizer = tokenizer
+        self.add_bos_token = add_bos_token
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._tokenizer, name)
+
+
+def _cut_at_stop_sequence(text: str, stop_sequences: list[str] | None) -> str:
+    """Truncate text at the first non-empty stop sequence occurrence."""
+    if not stop_sequences:
+        return text
+
+    smallest_idx = len(text)
+    for stop_sequence in stop_sequences:
+        if not stop_sequence:
+            continue
+        idx = text.find(stop_sequence)
+        if idx != -1 and idx < smallest_idx:
+            smallest_idx = idx
+    return text[:smallest_idx]
+
+
 # Enable with VLLM_DEBUG_REQUESTS=1
 _DEBUG_REQUESTS = os.environ.get("VLLM_DEBUG_REQUESTS", "").lower() in ("1", "true", "yes")
 
@@ -179,6 +206,12 @@ class VLLMServerProvider(InferenceProvider):
         trust_remote_code: bool = False,
         log_dir: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        revision: str | None = None,
+        add_bos_token: bool | None = None,
+        prompt_logprobs: int | None = None,
+        completion_use_prompt_token_ids: bool | None = None,
+        completion_client_side_stop_trim: bool | None = None,
+        completion_sentencepiece_cleanup: bool | None = None,
         **server_kwargs: Any,
     ) -> None:
         """Initialize the provider.
@@ -197,20 +230,41 @@ class VLLMServerProvider(InferenceProvider):
             trust_remote_code: Trust remote code for model loading (server mode).
             log_dir: Directory to write server logs to (server mode).
             chat_template_kwargs: Extra kwargs for chat template (e.g., {"enable_thinking": false}).
+            revision: HuggingFace revision/commit hash for managed server startup and
+                local tokenizer loading.
+            add_bos_token: Optional provider-level BOS override for local tokenization paths.
+                This matches the old oe-eval-internal runtime behavior and is not forwarded
+                as a vLLM server CLI argument.
+            prompt_logprobs: Number of prompt logprobs to request for loglikelihood scoring.
+                Defaults to 5 in the current runtime.
+            completion_use_prompt_token_ids: If True, locally tokenize completion prompts
+                and send token IDs to /completions instead of raw prompt strings.
+            completion_client_side_stop_trim: If True, trim completion text at the first
+                stop sequence client-side after generation.
+            completion_sentencepiece_cleanup: If True, replace SentencePiece space markers
+                with actual spaces in completion outputs.
             **server_kwargs: Additional vLLM server arguments.
         """
         super().__init__(model_name)
+        self._beaker_reporter = BeakerStatusReporter()
         self.timeout = timeout
         self.max_concurrency = max_concurrency
         self.max_retries = max_retries
         self.chat_template_kwargs = chat_template_kwargs
+        self._add_bos_token = add_bos_token
+        self._prompt_logprobs = prompt_logprobs if prompt_logprobs is not None else 5
+        self._completion_use_prompt_token_ids = bool(completion_use_prompt_token_ids)
+        self._completion_client_side_stop_trim = bool(completion_client_side_stop_trim)
+        self._completion_sentencepiece_cleanup = bool(completion_sentencepiece_cleanup)
         self._tokenizer_path = tokenizer or model_name
+        self._tokenizer_revision = revision
+        self._tokenizer_trust_remote_code = trust_remote_code
         self._client: AsyncOpenAI | None = None
         self._http_client: httpx.AsyncClient | None = None
         self._raw_http_client: httpx.AsyncClient | None = None
         self._openai_module: Any = None
         self._tokenizer: Any = None
-        self._server: VLLMServerProcess | None = None
+        self._server: VLLMServerProcess | None = None  # type: ignore[possibly-unresolved-reference]
         self._max_length: int | None = None
 
         if base_url:
@@ -226,28 +280,33 @@ class VLLMServerProvider(InferenceProvider):
                 srv_kwargs["max_model_len"] = max_model_len
             if tokenizer:
                 srv_kwargs["tokenizer"] = tokenizer
+            if revision is not None:
+                srv_kwargs["revision"] = revision
             if enable_auto_tool_choice:
                 srv_kwargs["enable_auto_tool_choice"] = True
                 if tool_call_parser:
                     srv_kwargs["tool_call_parser"] = tool_call_parser
             if trust_remote_code:
                 srv_kwargs["trust_remote_code"] = True
-            if chat_template_kwargs:
-                srv_kwargs["chat_template_kwargs"] = chat_template_kwargs
-
             self._server = VLLMServerProcess(
                 model_name=model_name,
                 tensor_parallel_size=tensor_parallel_size,
                 log_dir=log_dir,
                 **srv_kwargs,
             )
-            self._server.start()
+
+            def _on_startup(msg: str) -> None:
+                logger.info(msg)
+                self._beaker_reporter.update(msg)
+
+            self._server.start(progress_callback=_on_startup)
             self.base_url = self._server.base_url
 
     def close(self) -> None:
         """Close the provider and stop managed server if any."""
-        if self._server is not None:
-            self._server.stop()
+        server = getattr(self, "_server", None)
+        if server is not None:
+            server.stop()
             self._server = None
 
     def __del__(self) -> None:
@@ -278,6 +337,7 @@ class VLLMServerProvider(InferenceProvider):
                     "Could not determine max_model_len from server, defaulting to %d",
                     self._max_length,
                 )
+        assert self._max_length is not None
         return self._max_length
 
     def _get_or_create_client(self) -> AsyncOpenAI:
@@ -356,6 +416,15 @@ class VLLMServerProvider(InferenceProvider):
         assert client is not None, "AsyncOpenAI client creation failed"
         return client
 
+    def _get_local_tokenizer_load_kwargs(self) -> dict[str, Any]:
+        """Build kwargs for local HuggingFace tokenizer loads."""
+        tokenizer_kwargs: dict[str, Any] = {
+            "trust_remote_code": self._tokenizer_trust_remote_code,
+        }
+        if self._tokenizer_revision is not None:
+            tokenizer_kwargs["revision"] = self._tokenizer_revision
+        return tokenizer_kwargs
+
     def _get_tokenizer(self, *, require_local: bool = False) -> Any:
         """Get or create the tokenizer.
 
@@ -372,7 +441,10 @@ class VLLMServerProvider(InferenceProvider):
             if self._tokenizer is None or isinstance(self._tokenizer, RemoteTokenizer):
                 from transformers import AutoTokenizer
 
-                self._tokenizer = AutoTokenizer.from_pretrained(self._tokenizer_path)
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    self._tokenizer_path,
+                    **self._get_local_tokenizer_load_kwargs(),
+                )
             return self._tokenizer
 
         # Use remote tokenizer by default (no transformers dependency)
@@ -402,6 +474,196 @@ class VLLMServerProvider(InferenceProvider):
         else:
             return await self._generate_chat(client, request, params)
 
+    def describe_request(
+        self,
+        request: LMRequest,
+        sampling_params: SamplingParams | None = None,
+    ) -> dict[str, Any] | None:
+        params = self._default_sampling_params(sampling_params)
+        trace = super().describe_request(request, sampling_params)
+        if trace is None:
+            return None
+
+        if request.request_type == RequestType.LOGLIKELIHOOD:
+            trace["provider"] = "VLLMServerProvider"
+            trace["endpoint"] = "/completions"
+            trace["generation_kwargs"] = {
+                "max_gen_toks": 1,
+                "do_sample": False,
+                "temperature": params.temperature,
+                "prompt_logprobs": self._prompt_logprobs,
+                "add_special_tokens": False,
+            }
+            trace["stop_sequences"] = []
+            trace["input_mode"] = "prompt_token_ids"
+            return trace
+
+        use_completions = (
+            request.request_type == RequestType.COMPLETION
+            and not request.messages
+            and request.prompt
+        )
+        if use_completions:
+            trace["provider"] = "VLLMServerProvider"
+            trace["endpoint"] = "/completions"
+            trace["generation_kwargs"] = {
+                "max_gen_toks": params.max_tokens,
+                "do_sample": params.do_sample and params.temperature > 0,
+                "temperature": params.temperature,
+                "logprobs": 1,
+                "num_samples": params.num_samples,
+                "add_special_tokens": False,
+            }
+            if params.do_sample and params.temperature > 0:
+                if params.top_p is not None:
+                    trace["generation_kwargs"]["top_p"] = params.top_p
+                if params.top_k is not None:
+                    trace["generation_kwargs"]["top_k"] = params.top_k
+            trace["stop_sequences"] = self._get_completion_stop_sequences(params) or []
+            trace["input_mode"] = (
+                "prompt_token_ids" if self._completion_use_prompt_token_ids else "text"
+            )
+            return trace
+
+        trace["provider"] = "VLLMServerProvider"
+        trace["endpoint"] = "/chat/completions"
+        generation_kwargs: dict[str, Any] = {
+            "max_gen_toks": params.max_tokens,
+            "do_sample": params.do_sample and params.temperature > 0,
+            "temperature": params.temperature,
+            "logprobs": True,
+            "top_logprobs": 1,
+            "num_samples": params.num_samples,
+        }
+        if params.do_sample and params.temperature > 0:
+            if params.top_p is not None:
+                generation_kwargs["top_p"] = params.top_p
+            if params.top_k is not None:
+                generation_kwargs["top_k"] = params.top_k
+        if self.chat_template_kwargs:
+            generation_kwargs["chat_template_kwargs"] = dict(self.chat_template_kwargs)
+        trace["generation_kwargs"] = generation_kwargs
+        trace["stop_sequences"] = list(params.stop_sequences or ())
+        trace["input_mode"] = "messages"
+        return trace
+
+    def _get_completion_eos_stop(self) -> str | None:
+        """Best-effort EOS stop string for completion parity with oe-eval."""
+        try:
+            tokenizer = self._get_tokenizer(require_local=True)
+        except (ImportError, Exception):
+            return None
+
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            try:
+                eos_token = tokenizer.decode([eos_token_id], skip_special_tokens=False)
+            except TypeError:
+                eos_token = tokenizer.decode([eos_token_id])
+            if eos_token:
+                return eos_token
+
+        eos_token = getattr(tokenizer, "eos_token", None)
+        return str(eos_token) if eos_token else None
+
+    def _get_completion_stop_sequences(self, params: SamplingParams) -> list[str] | None:
+        """Build stop sequences for completions, including EOS when available."""
+        stop_sequences = list(params.stop_sequences or ())
+        eos_stop = self._get_completion_eos_stop()
+        if eos_stop and eos_stop not in stop_sequences:
+            stop_sequences.append(eos_stop)
+        return stop_sequences or None
+
+    def _get_completion_prompt_payload(self, prompt: str) -> str | list[int]:
+        """Build completion prompt payload, optionally using local token IDs for parity."""
+        if not self._completion_use_prompt_token_ids:
+            return prompt
+
+        tokenizer = self._get_tokenizer(require_local=True)
+        return tokenizer.encode(prompt, add_special_tokens=bool(self._add_bos_token))
+
+    def _postprocess_completion_text(self, text: str, stop_sequences: list[str] | None) -> str:
+        """Apply optional legacy completion post-processing."""
+        if self._completion_sentencepiece_cleanup:
+            text = text.replace("\u2581", " ")
+        if self._completion_client_side_stop_trim:
+            text = _cut_at_stop_sequence(text, stop_sequences)
+        return text
+
+    def _completion_metadata_from_logprobs(
+        self,
+        *,
+        tokens: list[str],
+        token_logprobs: list[float | None],
+        metadata: dict[str, Any],
+    ) -> list[LogProbEntry] | None:
+        """Convert completion logprob payload into standard entries and metadata."""
+        logprob_entries: list[LogProbEntry] = []
+        for token, logprob in zip(tokens, token_logprobs, strict=False):
+            if logprob is not None:
+                logprob_entries.append({"token": token, "logprob": logprob})
+
+        if logprob_entries:
+            sum_logits = sum(entry["logprob"] for entry in logprob_entries)
+            num_tokens = len(logprob_entries)
+            metadata.update(
+                {
+                    "sum_logits": sum_logits,
+                    "num_tokens": num_tokens,
+                    "num_tokens_all": num_tokens,
+                }
+            )
+            return logprob_entries
+
+        return None
+
+    def _completion_usage_metadata(self, usage: Any) -> dict[str, Any]:
+        """Extract completion usage metadata from SDK or raw JSON responses."""
+        if not usage:
+            return {}
+
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+        else:
+            prompt_tokens = getattr(usage, "prompt_tokens", None)
+            completion_tokens = getattr(usage, "completion_tokens", None)
+
+        metadata: dict[str, Any] = {}
+        if prompt_tokens is not None:
+            metadata["prompt_tokens"] = prompt_tokens
+        if completion_tokens is not None:
+            metadata["completion_tokens"] = completion_tokens
+        return metadata
+
+    def _build_completion_output(
+        self,
+        *,
+        text: str,
+        logprobs_payload: Any,
+        usage: Any,
+        stop_sequences: list[str] | None,
+    ) -> LMOutput:
+        """Create a standardized LMOutput from completion response payloads."""
+        metadata = self._completion_usage_metadata(usage)
+        processed_text = self._postprocess_completion_text(text, stop_sequences)
+
+        logprob_entries: list[LogProbEntry] | None = None
+        if logprobs_payload is not None:
+            if isinstance(logprobs_payload, dict):
+                tokens = logprobs_payload.get("tokens") or []
+                token_logprobs = logprobs_payload.get("token_logprobs") or []
+            else:
+                tokens = getattr(logprobs_payload, "tokens", None) or []
+                token_logprobs = getattr(logprobs_payload, "token_logprobs", None) or []
+            logprob_entries = self._completion_metadata_from_logprobs(
+                tokens=tokens,
+                token_logprobs=token_logprobs,
+                metadata=metadata,
+            )
+
+        return LMOutput(text=processed_text, logprobs=logprob_entries, metadata=metadata)
+
     async def _generate_completion(
         self, client: AsyncOpenAI, request: LMRequest, params: SamplingParams
     ) -> list[LMOutput]:
@@ -413,56 +675,55 @@ class VLLMServerProvider(InferenceProvider):
             "max_tokens": params.max_tokens,
             "logprobs": 1,  # Request logprobs for metrics
         }
+        extra_body: dict[str, Any] = {"add_special_tokens": False}
 
-        # Handle do_sample=False (greedy decoding)
+        # Always send temperature explicitly to avoid server defaults (OpenAI API defaults to 1.0)
+        kwargs["temperature"] = params.temperature
         if params.do_sample and params.temperature > 0:
-            kwargs["temperature"] = params.temperature
             if params.top_p is not None:
                 kwargs["top_p"] = params.top_p
             if params.top_k is not None:
-                kwargs["extra_body"] = {"top_k": params.top_k}
-        if params.stop_sequences:
-            kwargs["stop"] = list(params.stop_sequences)[:4]
+                extra_body["top_k"] = params.top_k
+        stop_sequences = self._get_completion_stop_sequences(params)
+        if stop_sequences:
+            kwargs["stop"] = stop_sequences
+        if self._completion_use_prompt_token_ids:
+            http_client = self._get_raw_http_client()
+            response = await http_client.post(
+                f"{self.base_url}/completions",
+                json={
+                    **kwargs,
+                    "prompt": self._get_completion_prompt_payload(request.prompt),
+                    **extra_body,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            usage = data.get("usage")
+            return [
+                self._build_completion_output(
+                    text=choice.get("text") or "",
+                    logprobs_payload=choice.get("logprobs"),
+                    usage=usage,
+                    stop_sequences=stop_sequences,
+                )
+                for choice in data.get("choices", [])
+            ]
+
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         response = await client.completions.create(**kwargs)
-
-        # Capture usage for accurate metrics
         usage = getattr(response, "usage", None)
-
-        outputs = []
-        for choice in response.choices:
-            text = choice.text or ""
-
-            # Convert logprobs to standard format
-            logprob_entries: list[LogProbEntry] | None = None
-            metadata: dict[str, Any] = {}
-
-            # Store token counts from server for accurate metrics
-            if usage:
-                metadata["prompt_tokens"] = usage.prompt_tokens
-                metadata["completion_tokens"] = usage.completion_tokens
-
-            logprobs_data = getattr(choice, "logprobs", None)
-            if logprobs_data and hasattr(logprobs_data, "token_logprobs"):
-                tokens = logprobs_data.tokens or []
-                token_logprobs = logprobs_data.token_logprobs or []
-                logprob_entries = []
-                for token, logprob in zip(tokens, token_logprobs, strict=False):
-                    if logprob is not None:
-                        logprob_entries.append({"token": token, "logprob": logprob})
-
-                if logprob_entries:
-                    sum_logits = sum(entry["logprob"] for entry in logprob_entries)
-                    num_tokens = len(logprob_entries)
-                    metadata = {
-                        "sum_logits": sum_logits,
-                        "num_tokens": num_tokens,
-                        "num_tokens_all": num_tokens,
-                    }
-
-            outputs.append(LMOutput(text=text, logprobs=logprob_entries, metadata=metadata))
-
-        return outputs
+        return [
+            self._build_completion_output(
+                text=choice.text or "",
+                logprobs_payload=getattr(choice, "logprobs", None),
+                usage=usage,
+                stop_sequences=stop_sequences,
+            )
+            for choice in response.choices
+        ]
 
     async def _generate_chat(
         self, client: AsyncOpenAI, request: LMRequest, params: SamplingParams
@@ -487,17 +748,16 @@ class VLLMServerProvider(InferenceProvider):
             "max_tokens": params.max_tokens,
         }
 
-        # Handle do_sample=False (greedy decoding)
+        # Always send temperature explicitly to avoid server defaults (OpenAI API defaults to 1.0)
+        kwargs["temperature"] = params.temperature
         extra_body: dict[str, Any] = {}
         if params.do_sample and params.temperature > 0:
-            kwargs["temperature"] = params.temperature
             if params.top_p is not None:
                 kwargs["top_p"] = params.top_p
             if params.top_k is not None:
                 extra_body["top_k"] = params.top_k
         if params.stop_sequences:
-            # OpenAI API supports max 4 stop sequences
-            kwargs["stop"] = list(params.stop_sequences)[:4]
+            kwargs["stop"] = list(params.stop_sequences)
         if tools:
             kwargs["tools"] = tools
         # Always request logprobs for metrics computation
@@ -601,6 +861,7 @@ class VLLMServerProvider(InferenceProvider):
             process,
             max_in_flight=self.max_concurrency,
             max_retries=self.max_retries,
+            on_progress=self._beaker_reporter.progress_callback("vLLM gen", units="req/sec"),
         )
         return [r if r is not None else [] for r in results]
 
@@ -622,7 +883,11 @@ class VLLMServerProvider(InferenceProvider):
         """
         return run_async(self.agenerate(requests, sampling_params))
 
-    async def _logprobs_single_impl(self, request: LMRequest) -> list[LMOutput]:
+    async def _logprobs_single_impl(
+        self,
+        request: LMRequest,
+        params: SamplingParams | None = None,
+    ) -> list[LMOutput]:
         """Compute logprobs for continuations using raw prompt_logprobs.
 
         Uses vLLM's prompt_logprobs feature with integer token ID keys
@@ -638,6 +903,9 @@ class VLLMServerProvider(InferenceProvider):
             tokenizer = self._get_tokenizer(require_local=True)
         except (ImportError, Exception):
             tokenizer = self._get_tokenizer(require_local=False)
+        if self._add_bos_token is not None:
+            tokenizer = _TokenizerBosOverride(tokenizer, self._add_bos_token)
+        params = self._default_sampling_params(params)
 
         # Get the context/prompt text
         context = request.prompt
@@ -665,7 +933,8 @@ class VLLMServerProvider(InferenceProvider):
             # Left-truncate to max_length - 1 to match inline vLLM provider behavior.
             # This ensures long prompts are handled the same way as oe-eval-internal:
             # the context is left-truncated while preserving the continuation tokens.
-            max_len = self.max_length
+            # Use per-request max_length if set (e.g., from task config), else provider default.
+            max_len = request.max_length or self.max_length
             full_tokens = context_enc + continuation_enc
             if len(full_tokens) > max_len - 1:
                 full_tokens = full_tokens[-(max_len - 1) :]
@@ -685,8 +954,8 @@ class VLLMServerProvider(InferenceProvider):
                     "model": self.model_name,
                     "prompt": full_tokens,
                     "max_tokens": 1,
-                    "temperature": 0.0,
-                    "prompt_logprobs": 5,
+                    "temperature": params.temperature,
+                    "prompt_logprobs": self._prompt_logprobs,
                     "add_special_tokens": False,
                 },
             )
@@ -766,11 +1035,19 @@ class VLLMServerProvider(InferenceProvider):
 
         return outputs
 
-    async def _logprobs_single_async(self, request: LMRequest) -> list[LMOutput]:
+    async def _logprobs_single_async(
+        self,
+        request: LMRequest,
+        params: SamplingParams | None = None,
+    ) -> list[LMOutput]:
         """Compute logprobs for a single request."""
-        return await self._logprobs_single_impl(request)
+        return await self._logprobs_single_impl(request, params)
 
-    async def alogprobs(self, requests: list[LMRequest]) -> list[list[LMOutput]]:
+    async def alogprobs(
+        self,
+        requests: list[LMRequest],
+        sampling_params: SamplingParams | None = None,
+    ) -> list[list[LMOutput]]:
         """Async compute logprobs for continuations.
 
         Args:
@@ -781,9 +1058,10 @@ class VLLMServerProvider(InferenceProvider):
         """
         from olmo_eval.inference.dispatch import dispatch_concurrent
 
+        params = self._default_sampling_params(sampling_params)
         results = await dispatch_concurrent(
             requests,
-            self._logprobs_single_async,
+            lambda request: self._logprobs_single_async(request, params),
             max_in_flight=self.max_concurrency,
             max_retries=self.max_retries,
         )
@@ -793,7 +1071,7 @@ class VLLMServerProvider(InferenceProvider):
         if failed_count > 0:
             # Try to get the actual error by running one request directly
             try:
-                await self._logprobs_single_async(requests[0])
+                await self._logprobs_single_async(requests[0], params)
             except Exception as e:
                 logger.error(
                     f"alogprobs: {failed_count}/{len(requests)} requests failed. First error: {e!r}"
@@ -802,7 +1080,11 @@ class VLLMServerProvider(InferenceProvider):
         # Replace None with empty list for failed requests
         return [r if r is not None else [] for r in results]
 
-    def logprobs(self, requests: list[LMRequest]) -> list[list[LMOutput]]:
+    def logprobs(
+        self,
+        requests: list[LMRequest],
+        sampling_params: SamplingParams | None = None,
+    ) -> list[list[LMOutput]]:
         """Compute logprobs for continuations.
 
         Args:
@@ -811,4 +1093,4 @@ class VLLMServerProvider(InferenceProvider):
         Returns:
             List of output lists with logprobs populated.
         """
-        return run_async(self.alogprobs(requests))
+        return run_async(self.alogprobs(requests, sampling_params))

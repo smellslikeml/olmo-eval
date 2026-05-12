@@ -233,7 +233,9 @@ def _build_server_command(
         tool_call_parser: Parser for tool calls (auto-detected if not specified
             when enable_auto_tool_choice is True)
         enable_prefix_caching: Enable prefix caching for faster inference (default: True)
-        chat_template_kwargs: Extra kwargs for chat template (e.g., {"enable_thinking": false})
+        chat_template_kwargs: Extra kwargs for chat template (e.g., {"enable_thinking": false}).
+            These are applied at request time by the provider for broad vLLM compatibility,
+            rather than being forwarded as server CLI flags.
         **kwargs: Additional vLLM server arguments. May include patch_olmo3_tool_parser
             which controls whether to use the custom OLMo3 chat template.
 
@@ -291,10 +293,6 @@ def _build_server_command(
     # Prefix caching (enabled by default for faster inference)
     if enable_prefix_caching:
         cmd.append("--enable-prefix-caching")
-
-    # Chat template kwargs (e.g., for Qwen3 enable_thinking)
-    if chat_template_kwargs:
-        cmd.extend(["--chat-template-kwargs", json.dumps(chat_template_kwargs)])
 
     # Disable tqdm loading bar by default, enable with --debug-provider
     if is_debug_provider():
@@ -360,6 +358,7 @@ class VLLMServerProcess:
         self.server_kwargs = kwargs
         self._process: subprocess.Popen | None = None
         self._log_file: Any | None = None
+        self._log_path: Any | None = None
         self._started = False
 
     @property
@@ -373,6 +372,33 @@ class VLLMServerProcess:
             logger.log(level, f"[{self.owner}] {msg}")
         else:
             logger.log(level, msg)
+
+    def _read_log_output(self) -> str | None:
+        """Read server logs, preferring the current server's log file."""
+        if not self.log_dir:
+            return None
+
+        import pathlib
+
+        candidate_paths: list[pathlib.Path] = []
+        if self._log_path is not None:
+            candidate_paths.append(self._log_path)
+
+        log_dir = pathlib.Path(self.log_dir)
+        if log_dir.exists():
+            for path in sorted(
+                log_dir.glob("vllm_server*.log"),
+                key=lambda log_path: log_path.stat().st_mtime,
+                reverse=True,
+            ):
+                if path not in candidate_paths:
+                    candidate_paths.append(path)
+
+        for log_path in candidate_paths:
+            if log_path.exists():
+                return log_path.read_text(errors="replace")
+
+        return None
 
     def start(self, progress_callback: ProgressCallback | None = None) -> str:
         """Start the vLLM server.
@@ -404,6 +430,11 @@ class VLLMServerProcess:
 
         # Build environment for subprocess (child only, don't mutate parent)
         env = os.environ.copy()
+        # VLLM_PYTHON is our own steering variable for selecting which Python
+        # interpreter launches the server. Once the command is built, vLLM
+        # itself does not need to see it, and forwarding it triggers a warning
+        # because vLLM treats unknown VLLM_* variables as suspicious.
+        env.pop("VLLM_PYTHON", None)
         if self.gpu_ids:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in self.gpu_ids)
 
@@ -424,9 +455,9 @@ class VLLMServerProcess:
         if self.log_dir:
             import pathlib
 
-            log_path = pathlib.Path(self.log_dir) / "vllm_server.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._log_file = open(log_path, "w")  # noqa: SIM115
+            self._log_path = pathlib.Path(self.log_dir) / f"vllm_server_{self.port}.log"
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_file = open(self._log_path, "w")  # noqa: SIM115
             self._process = subprocess.Popen(
                 cmd,
                 stdout=self._log_file,
@@ -468,11 +499,7 @@ class VLLMServerProcess:
             # If log_dir is set, output went to file - read it from there
             if process_output is None and self.log_dir:
                 with suppress(Exception):
-                    import pathlib
-
-                    log_path = pathlib.Path(self.log_dir) / "vllm_server.log"
-                    if log_path.exists():
-                        process_output = log_path.read_text(errors="replace")
+                    process_output = self._read_log_output()
 
             # Log the captured output for debugging
             if process_output:
@@ -487,7 +514,7 @@ class VLLMServerProcess:
                 error_msg += f". Error: {last_error}"
             if process_output:
                 # Include a truncated version of the output in the exception
-                max_output_len = 2000
+                max_output_len = 20000
                 if len(process_output) > max_output_len:
                     truncated_output = "...[truncated]...\n" + process_output[-max_output_len:]
                 else:

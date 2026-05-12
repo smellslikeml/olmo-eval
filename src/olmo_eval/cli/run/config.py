@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -53,8 +54,19 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         if key in base and isinstance(base[key], dict) and isinstance(value, dict):
             _deep_merge(base[key], value)
         else:
-            base[key] = value
+            base[key] = copy.deepcopy(value)
     return base
+
+
+def _merge_dict_into_list_items(items: list[Any], override: dict[str, Any], key_path: str) -> None:
+    """Deep-merge a dict override into every dict item in a list."""
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"Invalid override path '{key_path}': cannot merge dict into list item "
+                f"{idx} of type {type(item).__name__}"
+            )
+        _deep_merge(item, copy.deepcopy(override))
 
 
 def _apply_dotlist_overrides(base_dict: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
@@ -64,7 +76,15 @@ def _apply_dotlist_overrides(base_dict: dict[str, Any], overrides: list[str]) ->
     this function treats them as list indices (e.g., sandboxes.0.mode=modal).
 
     Supports JSON values for nested structures:
-        sandboxes.0='{"mode":"modal","instances":4}'
+        sandboxes.0='{"mode":"modal"}'
+        sandboxes='{"mode":"modal","instances":64}'
+
+    A dict override applied directly to the top-level sandboxes key is treated
+    specially:
+    - most fields are deep-merged into each existing sandbox config
+    - the special fields ``instances`` and ``min_instances`` are peeled off into
+      the shared ``sandbox_pool_instances`` budget and
+      ``sandbox_pool_min_instances`` minimum instead of being applied per sandbox
 
     Args:
         base_dict: The base dictionary to modify.
@@ -130,6 +150,18 @@ def _apply_dotlist_overrides(base_dict: dict[str, Any], overrides: list[str]) ->
         elif isinstance(target, dict):
             if isinstance(parsed_value, dict) and isinstance(target.get(final_key), dict):
                 _deep_merge(target[final_key], parsed_value)
+            elif (
+                final_key == "sandboxes"
+                and isinstance(parsed_value, dict)
+                and isinstance(target.get(final_key), list)
+            ):
+                override_dict = copy.deepcopy(parsed_value)
+                if "instances" in override_dict:
+                    base_dict["sandbox_pool_instances"] = override_dict.pop("instances")
+                if "min_instances" in override_dict:
+                    base_dict["sandbox_pool_min_instances"] = override_dict.pop("min_instances")
+                if override_dict:
+                    _merge_dict_into_list_items(target[final_key], override_dict, key_path)
             else:
                 target[final_key] = parsed_value
         else:

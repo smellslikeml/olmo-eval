@@ -125,6 +125,140 @@ class TestComputeModelHash:
         h = compute_model_hash(config)
         assert len(h) == 16
 
+    def test_ignores_operational_provider_fields(self):
+        """Replica count and transport fields should not split model identity."""
+        config1 = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+            "base_url": "http://localhost:8000/v1",
+            "max_concurrency": 64,
+            "num_instances": 8,
+            "required_secrets": ["API_KEY"],
+        }
+        config2 = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+        }
+
+        assert compute_model_hash(config1) == compute_model_hash(config2)
+
+    def test_trust_remote_code_changes_hash(self):
+        """Loader behavior can affect model identity and should split hashes."""
+        config1 = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+            "trust_remote_code": True,
+        }
+        config2 = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+        }
+
+        assert compute_model_hash(config1) != compute_model_hash(config2)
+
+    def test_ignores_operational_provider_kwargs(self):
+        """Parallelism and runtime tuning kwargs should not change the hash."""
+        config1 = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+            "kwargs": {
+                "enable_expert_parallel": True,
+                "enable_prefix_caching": False,
+                "gpu_memory_utilization": 0.6,
+                "max_num_batched_tokens": 8192,
+                "max_num_seqs": 32,
+                "pipeline_parallel_size": 2,
+                "tensor_parallel_size": 4,
+            },
+        }
+        config2 = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+        }
+
+        assert compute_model_hash(config1) == compute_model_hash(config2)
+
+    def test_attention_backend_changes_hash(self):
+        """Attention backend can affect numerics, so it should split hashes."""
+        config1 = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+            "attention_backend": "TRITON_ATTN",
+        }
+        config2 = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+            "attention_backend": "FLASH_ATTN",
+        }
+        config3 = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+        }
+
+        assert compute_model_hash(config1) != compute_model_hash(config2)
+        assert compute_model_hash(config1) != compute_model_hash(config3)
+
+    def test_attention_backend_is_canonicalized(self):
+        """The backend should hash the same whether stored at top level or in kwargs."""
+        top_level = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+            "attention_backend": "TRITON_ATTN",
+        }
+        in_kwargs = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+            "kwargs": {"attention_backend": "TRITON_ATTN"},
+        }
+        duplicated = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+            "attention_backend": "TRITON_ATTN",
+            "kwargs": {"attention_backend": "TRITON_ATTN"},
+        }
+
+        assert compute_model_hash(top_level) == compute_model_hash(in_kwargs)
+        assert compute_model_hash(top_level) == compute_model_hash(duplicated)
+
+    def test_default_chat_template_kwargs_change_hash(self):
+        """Chat template defaults can affect decoding behavior and must split hashes."""
+        base = {
+            "kind": "vllm_server",
+            "model": "Qwen/Qwen3-8B",
+        }
+        with_override = {
+            **base,
+            "kwargs": {
+                "default_chat_template_kwargs": {"enable_thinking": False},
+            },
+        }
+        with_different_override = {
+            **base,
+            "kwargs": {
+                "default_chat_template_kwargs": {"enable_thinking": True},
+            },
+        }
+
+        assert compute_model_hash(base) != compute_model_hash(with_override)
+        assert compute_model_hash(with_override) != compute_model_hash(with_different_override)
+
+    def test_behavioral_fields_still_change_hash(self):
+        """Behavior-affecting fields should remain part of the hash."""
+        base = {
+            "kind": "vllm",
+            "model": "allenai/Olmo-3-1025-7B",
+            "revision": "stage2-step47684",
+            "kwargs": {"add_bos_token": False},
+        }
+
+        assert compute_model_hash(base) != compute_model_hash({**base, "revision": "other-rev"})
+        assert compute_model_hash(base) != compute_model_hash(
+            {
+                **base,
+                "kwargs": {"add_bos_token": True},
+            }
+        )
+
 
 class TestConvertRunnerResults:
     """Tests for convert_runner_results function."""
@@ -201,3 +335,35 @@ class TestConvertRunnerResults:
         assert len(eval_result.tasks) == 1
         assert eval_result.tasks[0].task_name == "gsm8k"
         assert eval_result.tasks[0].metrics == {"exact_match": {"exact_match": 0.58}}
+
+    def test_s3_artifact_keys_use_predictions_and_requests_subdirs(self):
+        """Task artifact URIs should match the uploaded S3 directory layout."""
+        results = {
+            "model": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+            "provider": "hf",
+            "timestamp": "2024-06-20T14:00:00",
+            "tasks": {
+                "mmlu_astronomy:mc:olmo3base": {
+                    "metrics": {"accuracy": {"logprob": 0.5}},
+                    "task_hash": "abcdef123456",
+                },
+            },
+        }
+
+        eval_result = convert_runner_results(
+            results,
+            experiment_id="exp-789",
+            s3_location="s3://ai2-llm/olmo-eval/group/model_hash/exp-789",
+        )
+
+        task = eval_result.tasks[0]
+        assert (
+            task.s3_predictions_key == "s3://ai2-llm/olmo-eval/group/model_hash/exp-789/"
+            "predictions/nvidia_NVIDIA-Nemotron-Nano-9B-v2/"
+            "mmlu_astronomy_mc_olmo3base_123456-predictions.jsonl"
+        )
+        assert (
+            task.s3_requests_key == "s3://ai2-llm/olmo-eval/group/model_hash/exp-789/"
+            "requests/nvidia_NVIDIA-Nemotron-Nano-9B-v2/"
+            "mmlu_astronomy_mc_olmo3base_123456-requests.jsonl"
+        )

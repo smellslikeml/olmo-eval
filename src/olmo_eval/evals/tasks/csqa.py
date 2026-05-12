@@ -5,7 +5,7 @@ from typing import Any
 
 from olmo_eval.common.formatters import MultipleChoiceFormatter
 from olmo_eval.common.metrics import (
-    BPBMetric,
+    BPBMetricInstanceAvg,
     LogprobMCAccuracyMetric,
     LogprobUncondMCAccuracyMetric,
 )
@@ -150,25 +150,38 @@ class CommonsenseQA(Task):
         )
 
 
-register_variant("csqa", "rc")
+register_variant("csqa", "rc", metrics=(LogprobUncondMCAccuracyMetric(),))
 register_variant("csqa", "mc", formatter=MultipleChoiceFormatter())
 register_variant(
     "csqa",
     "olmo3base",
     num_fewshot=5,
     fewshot_source="olmes_csqa_fixed",
-    metrics=(LogprobUncondMCAccuracyMetric(), BPBMetric()),
-    primary_metric=LogprobUncondMCAccuracyMetric(),
+    data_source=DataSource(path="commonsense_qa", split="validation"),
+    metrics=(LogprobUncondMCAccuracyMetric(),),
+)
+register_variant(
+    "csqa",
+    "mc_olmo3base",
+    formatter=MultipleChoiceFormatter(),
+    num_fewshot=5,
+    fewshot_source="olmes_csqa_fixed",
+    data_source=DataSource(path="commonsense_qa", split="validation+train"),
+    limit=10000,
+    seed=1234,
 )
 register_variant(
     "csqa",
     "xlarge",
-    data_source=DataSource(path="commonsense_qa", split="train+validation"),
+    data_source=DataSource(path="commonsense_qa", split="validation+train"),
     num_fewshot=5,
     limit=10000,
+    seed=1234,
     fewshot_source="olmes_csqa_fixed",
 )
-register_variant("csqa", "bpb", metrics=(BPBMetric(),), primary_metric=BPBMetric())
+register_variant(
+    "csqa", "bpb", metrics=(BPBMetricInstanceAvg(),), primary_metric=BPBMetricInstanceAvg()
+)
 register_variant(
     "csqa",
     "olmes",

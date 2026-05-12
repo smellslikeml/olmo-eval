@@ -5,10 +5,9 @@ from __future__ import annotations
 import multiprocessing as mp
 import queue
 import time
-from typing import Any
 
 from olmo_eval.common.logging import get_logger
-from olmo_eval.runners.asynq.types import SCORER_FATAL, WORKER_FATAL
+from olmo_eval.runners.asynq.types import WORKER_FATAL
 
 logger = get_logger(__name__)
 
@@ -141,7 +140,7 @@ def wait_for_workers_ready(
 
 
 def wait_for_init_times(
-    init_times: Any,
+    init_queue: mp.Queue,
     num_workers: int,
     workers: list[mp.process.BaseProcess] | None = None,
     result_queue: mp.Queue | None = None,
@@ -151,7 +150,7 @@ def wait_for_init_times(
     """Wait for all workers to report their initialization times.
 
     Args:
-        init_times: Shared manager dict that workers write their init times to.
+        init_queue: Queue that workers put (worker_id, init_time) tuples on.
         num_workers: Expected number of workers.
         workers: Optional list of worker processes to check for crashes.
         result_queue: Optional queue to check for fatal error markers.
@@ -164,11 +163,23 @@ def wait_for_init_times(
     Raises:
         RuntimeError: If a worker crashes during initialization.
     """
+    collected: dict[str, float] = {}
     start_time = time.time()
 
     while time.time() - start_time < timeout:
-        if len(init_times) >= num_workers:
-            return dict(init_times)
+        if len(collected) >= num_workers:
+            return collected
+
+        # Drain all available init times from the queue
+        while True:
+            try:
+                worker_id, init_time = init_queue.get_nowait()
+                collected[worker_id] = init_time
+            except queue.Empty:
+                break
+
+        if len(collected) >= num_workers:
+            return collected
 
         # Check for worker crashes if workers and queue are provided
         if workers is not None and result_queue is not None:
@@ -177,59 +188,8 @@ def wait_for_init_times(
         time.sleep(check_interval)
 
     # Return what we have even if incomplete
-    logger.warning(f"Timed out waiting for init times: got {len(init_times)}/{num_workers} workers")
-    return dict(init_times)
-
-
-def wait_for_scorer_ready(
-    scorer_proc: mp.process.BaseProcess,
-    ready_event: Any,
-    scored_queue: mp.Queue,
-    timeout: float = 60.0,
-) -> None:
-    """Wait for the scoring worker to be ready.
-
-    Args:
-        scorer_proc: The scoring worker process.
-        ready_event: Event that scorer sets when ready.
-        scored_queue: Queue to check for fatal errors.
-        timeout: Maximum time to wait for scorer to be ready.
-
-    Raises:
-        RuntimeError: If scorer fails during startup.
-    """
-    from olmo_eval.runners.asynq.types import ScoredResponse
-
-    start_time = time.time()
-    check_interval = 0.1
-
-    while time.time() - start_time < timeout:
-        # Check if scorer signaled ready
-        if ready_event.is_set():
-            return
-
-        # Check if scorer died
-        if not scorer_proc.is_alive():
-            # Check queue for error message
-            try:
-                item: ScoredResponse = scored_queue.get_nowait()
-                if item.spec == SCORER_FATAL:
-                    raise RuntimeError(f"Scoring worker failed: {item.error}")
-            except queue.Empty:
-                pass
-            raise RuntimeError(
-                f"Scoring worker died during startup with exit code {scorer_proc.exitcode}"
-            )
-
-        time.sleep(check_interval)
-
-    # Timeout - check one more time
-    if not ready_event.is_set():
-        if not scorer_proc.is_alive():
-            raise RuntimeError(
-                f"Scoring worker died during startup with exit code {scorer_proc.exitcode}"
-            )
-        raise RuntimeError("Scoring worker timed out during initialization")
+    logger.warning(f"Timed out waiting for init times: got {len(collected)}/{num_workers} workers")
+    return collected
 
 
 __all__ = [
@@ -237,5 +197,4 @@ __all__ = [
     "check_workers_alive",
     "wait_for_workers_ready",
     "wait_for_init_times",
-    "wait_for_scorer_ready",
 ]
