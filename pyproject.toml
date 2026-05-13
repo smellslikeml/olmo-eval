@@ -31,7 +31,7 @@ dependencies = [
     "textual-plot>=0.10.1",
     "tree-sitter>=0.24.0",
     "tree-sitter-python>=0.23.0,<0.26.0",
-    "ifbench @ git+https://github.com/allenai/IFBench.git",
+    "ifbench @ git+https://github.com/allenai/IFBench.git@finbarr/clean-install",
     # syllapy (transitive via ifbench) imports pkg_resources, which setuptools>=81 removes.
     "setuptools<81",
 ]
@@ -145,12 +145,6 @@ vllm = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = [
-    # Vendored from oe-eval-internal (oe_eval/dependencies/ifeval/), kept as-is.
-    "src/olmo_eval/common/scorers/ifeval_deps/instructions.py",
-    "src/olmo_eval/common/scorers/ifeval_deps/instructions_util.py",
-    "src/olmo_eval/common/scorers/ifeval_deps/instructions_registry.py",
-]
 
 [tool.ruff.lint]
 select = [

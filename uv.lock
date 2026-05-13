@@ -3112,8 +3112,8 @@ wheels = [
 
 [[package]]
 name = "ifbench"
-version = "0.1.0"
-source = { git = "https://github.com/allenai/IFBench.git#1091c4c3de6c1f6ed12c012ed68f11ea450b0117" }
+version = "0.2.0"
+source = { git = "https://github.com/allenai/IFBench.git?rev=finbarr%2Fclean-install#b281f8d4dae7f4defffe737472b3e79c042b6705" }
 dependencies = [
     { name = "absl-py" },
     { name = "emoji" },
@@ -5313,7 +5313,7 @@ requires-dist = [
     { name = "click", specifier = "~=8.3.2" },
     { name = "datasets", specifier = ">=3.2.0" },
     { name = "httpx", marker = "extra == 'agents'", specifier = "~=0.28.1" },
-    { name = "ifbench", git = "https://github.com/allenai/IFBench.git" },
+    { name = "ifbench", git = "https://github.com/allenai/IFBench.git?rev=finbarr%2Fclean-install" },
     { name = "litellm", marker = "extra == 'litellm'", specifier = "~=1.80.11" },
     { name = "matplotlib", marker = "extra == 'analysis'", specifier = "~=3.10.8" },
     { name = "numpy", specifier = ">=1.20.0" },
