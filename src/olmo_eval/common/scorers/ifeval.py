@@ -53,6 +53,9 @@ def _check_one(
 ) -> bool:
     instruction = instruction_cls(instruction_id)
     cleaned_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    arg_keys = instruction.get_instruction_args_keys()
+    if "prompt_to_repeat" in arg_keys and not cleaned_kwargs.get("prompt_to_repeat"):
+        cleaned_kwargs["prompt_to_repeat"] = prompt
     instruction.build_description(**cleaned_kwargs)
     args = instruction.get_instruction_args()
     if args and "prompt" in args:
