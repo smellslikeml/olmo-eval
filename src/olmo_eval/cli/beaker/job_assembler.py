@@ -6,6 +6,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from olmo_eval.common.constants.infrastructure import (
+    BEAKER_DEFAULT_BUDGET,
     BEAKER_RESULT_DIR,
     cluster_has_weka,
 )
@@ -324,7 +325,7 @@ def assemble_external_eval_job(
         shared_memory="10GiB",
         retries=retries,
         workspace=workspace,
-        budget=budget,
+        budget=budget or BEAKER_DEFAULT_BUDGET,
         groups=groups or [],
         beaker_image=beaker_image,
         inject_aws_credentials=inject_aws_credentials,
