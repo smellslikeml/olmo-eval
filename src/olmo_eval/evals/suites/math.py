@@ -8,15 +8,16 @@ make_suite(
 )
 
 make_suite(
-    "aime_2022_to_2025",
+    "aime_2022_to_2026",
     (
         "aime_2022:pass_at_32",
         "aime_2023:pass_at_32",
         "aime_2024:pass_at_32",
         "aime_2025:pass_at_32",
+        "aime_2026:pass_at_32",
     ),
     aggregation=AggregationStrategy.AVERAGE_OF_AVERAGES,
-    description="AIME 2022-2025 combined.",
+    description="AIME 2022-2026 combined.",
 )
 
 make_suite(
@@ -24,6 +25,7 @@ make_suite(
     (
         "aime_2022:pass_at_32:16k",
         "aime_2023:pass_at_32:16k",
+        "aime_2024:pass_at_32:16k",
         "aime_2025:pass_at_32:16k",
         "aime_2026:pass_at_32:16k",
         "hmmt_nov_2025:pass_at_32:16k",
@@ -31,7 +33,6 @@ make_suite(
     ),
     aggregation=AggregationStrategy.AVERAGE,
     description=(
-        "Dev set for post-training math experiments: AIME 2022/2023/2025/2026 "
-        "and HMMT Nov 2025 / Feb 2026."
+        "Dev set for post-training math experiments: AIME 2022-2026 and HMMT Nov 2025 / Feb 2026."
     ),
 )
