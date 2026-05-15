@@ -517,6 +517,11 @@ class SafetyScorer(LLMJudgeScorer):
             judge_response["raw_judge_response"] = response
         logger.debug("Judge response: %s", judge_response)
         instance.metadata["judge_result"] = judge_response
+
+        assert instance.gold_answer is not None, (
+            "The safety judge requires setting a gold answer for comparison"
+        )
+
         cat, cat_response = instance.gold_answer.split("=")
 
         return float(judge_response[cat] == cat_response)

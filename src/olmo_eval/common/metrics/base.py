@@ -70,8 +70,10 @@ class Metric(ABC):
         """Serialize to a dictionary."""
         scorer = self.scorer
         scorer_name = (
-            scorer.to_dict()
-            if isinstance(scorer, type) and hasattr(scorer, "to_dict")
+            scorer.__name__
+            if isinstance(scorer, type)
+            else scorer.to_dict()
+            if hasattr(scorer, "to_dict")
             else asdict(scorer)
         )
         return {"type": self.__class__.__name__, "name": self.name, "scorer": scorer_name}
