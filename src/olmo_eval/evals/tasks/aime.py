@@ -156,7 +156,7 @@ for _year in (2022, 2023, 2024, 2025, 2026):
         sampling_params=_RLZERO_SAMPLING,
     )
 
-for _year in (2025, 2026):
+for _year in (2022, 2023, 2024, 2025, 2026):
     register_variant(
         f"aime_{_year}",
         "16k",

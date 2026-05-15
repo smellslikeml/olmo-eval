@@ -22,6 +22,8 @@ make_suite(
 make_suite(
     "math:posttrain:dev",
     (
+        "aime_2022:pass_at_32:16k",
+        "aime_2023:pass_at_32:16k",
         "aime_2025:pass_at_32:16k",
         "aime_2026:pass_at_32:16k",
         "hmmt_nov_2025:pass_at_32:16k",
@@ -29,6 +31,7 @@ make_suite(
     ),
     aggregation=AggregationStrategy.AVERAGE,
     description=(
-        "Dev set for post-training math experiments: AIME 2025/2026 and HMMT Nov 2025 / Feb 2026."
+        "Dev set for post-training math experiments: AIME 2022/2023/2025/2026 "
+        "and HMMT Nov 2025 / Feb 2026."
     ),
 )
