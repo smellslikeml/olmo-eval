@@ -8,6 +8,18 @@ make_suite(
 )
 
 make_suite(
+    "aime_2022_to_2025",
+    (
+        "aime_2022:pass_at_32",
+        "aime_2023:pass_at_32",
+        "aime_2024:pass_at_32",
+        "aime_2025:pass_at_32",
+    ),
+    aggregation=AggregationStrategy.AVERAGE_OF_AVERAGES,
+    description="AIME 2022-2025 combined.",
+)
+
+make_suite(
     "math:posttrain:dev",
     (
         "aime_2025:pass_at_32:16k",
