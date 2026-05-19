@@ -17,6 +17,7 @@ from .base import (
     PassPowKMetric,
     RecallMetric,
     SQuADF1Metric,
+    SubsetAccuracyMetric,
     ToolAccuracyMetric,
 )
 from .ifeval import (
@@ -48,4 +49,5 @@ __all__ = [
     "RecallMetric",
     "SQuADF1Metric",
     "ToolAccuracyMetric",
+    "SubsetAccuracyMetric",
 ]

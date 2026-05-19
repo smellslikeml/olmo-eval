@@ -321,6 +321,7 @@ class Harness:
         This transforms a request by adding:
         - Tool schemas (if config has tools)
         - System prompt (if configured and not already present)
+        - Formatted prompt with chat template (if a chat request)
 
         Args:
             request: Original request.
@@ -328,6 +329,7 @@ class Harness:
         Returns:
             New request with config applied.
         """
+
         messages = self._inject_system_prompt(request.messages)
 
         return LMRequest(

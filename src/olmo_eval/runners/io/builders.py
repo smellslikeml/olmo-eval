@@ -100,6 +100,10 @@ def build_predictions(scored: Sequence[Any], metrics: Sequence[Metric] = ()) -> 
             "label": label,
         }
 
+        # Add judge result if present (LLM-as-judge tasks)
+        if "judge_result" in resp.instance.metadata:
+            prediction["judge_result"] = resp.instance.metadata["judge_result"]
+
         # Add final_output text for chat/agent tasks
         if resp.outputs and resp.outputs[0].text:
             prediction["final_output"] = resp.outputs[0].text
