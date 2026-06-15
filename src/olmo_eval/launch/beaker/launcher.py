@@ -867,12 +867,15 @@ class BeakerLauncher:
                 # middleware. Torch is left unconstrained on purpose (no
                 # cuda-constraints here, unlike the main venv): vLLM requires a
                 # newer torch than the base image provides, so pinning it to the
-                # base build makes the install unresolvable.
+                # base build makes the install unresolvable. VCS lines are
+                # dropped because uv export pins them to a resolved commit, which
+                # conflicts with the branch-ref URL pyproject declares for the
+                # same package (e.g. ifbench).
                 vllm_lock_constraints = "/tmp/vllm-lock-constraints.txt"
                 steps.append(
                     f"cd /gantry-runtime && uv export --extra vllm "
                     f"--no-hashes --no-emit-project --frozen 2>/dev/null "
-                    f"| grep -vE '^(torch|nvidia-)' "
+                    f"| grep -vE '^(torch|nvidia-)' | grep -vE ' @ ' "
                     f"> {vllm_lock_constraints}"
                 )
                 steps.append(
